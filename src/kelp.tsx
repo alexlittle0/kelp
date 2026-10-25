@@ -728,7 +728,7 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
         note(`${view}\tunreadable`, key, depth + 1, `Not shown: binary, over ${MAX_FILE / 1_000_000} MB, or missing.`)
       } else if (isDiff) {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'No changes since the last commit.')
-        rows.push(...diffRows(view, path, shown.lines, depth + 1))
+        rows.push(...diffRows(key, path, shown.lines, depth + 1))
         if (shown.isCut) note(`${view}\tcut`, key, depth + 1, `… diff cut at ${MAX_DIFF_LINES} lines`)
       } else {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'Empty file.')
