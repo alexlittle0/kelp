@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
@@ -34,6 +34,10 @@ const STASH_ENV = {
   GIT_COMMITTER_EMAIL: 'kelp@localhost',
   GIT_COMMITTER_DATE: '@0 +0000',
 }
+// The coding agents kelp looks for among running processes.
+const AGENTS = ['claude', 'codex', 'aider', 'gemini', 'opencode', 'cursor-agent']
+// A claude counts as busy while its transcript was written this recently.
+const BUSY_MS = 30_000
 
 // ---- Types ----
 
@@ -60,7 +64,12 @@ type Tree = {
   isMerging: boolean
   // Its newest commit or edited file, ms since the epoch.
   lastAt: number
+  // The coding agents running in it.
+  agents: Agent[]
 }
+
+// A coding agent running in a worktree; `isBusy` is known only for claude, from its transcript.
+type Agent = { name: string; pid: number; isBusy?: boolean }
 
 type Repo = { dir: string; base: string; trees: Tree[] }
 
@@ -282,6 +291,7 @@ const loadTree = async (w: { path: string; head: string; branch: string }, base:
     conflicts,
     isMerging,
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
+    agents: [],
   }
 }
 
@@ -293,6 +303,10 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const base = await findBase(dir, worktrees[0]?.branch ?? '')
   const trees = await Promise.all(worktrees.map(w => loadTree(w, base)))
   trees.sort((a, b) => Number(b.isBase) - Number(a.isBase) || label(a).localeCompare(label(b)))
+  for (const agent of findAgents()) {
+    const { cwd, ...rest } = agent
+    treeAt(trees, cwd)?.agents.push(rest)
+  }
 
   return { dir, base, trees }
 }
@@ -420,6 +434,72 @@ const openInNvim = async (file: string, line: number) => {
   }
 
   return `Couldn't open ${shortPath(file)} in nvim`
+}
+
+// ---- Agents and tmux ----
+
+// The worktree holding `dir` most closely, as a worktree may sit inside another.
+const treeAt = <T extends { path: string }>(trees: T[], dir: string) =>
+  trees.filter(t => dir === t.path || dir.startsWith(`${t.path}/`)).sort((a, b) => b.path.length - a.path.length)[0]
+
+// The agent a process is, by its name or, when node, bun or python runs it, by its script's name.
+const agentOf = (pid: string) => {
+  try {
+    const name = readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+    if (AGENTS.includes(name)) return name
+    if (!/^(node|bun|python[\d.]*)$/.test(name)) return null
+    const script = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[1] ?? ''
+    const scriptName = script.split('/').pop()!.replace(/\.(js|mjs|cjs|py)$/, '')
+
+    return AGENTS.includes(scriptName) ? scriptName : null
+  } catch {
+    return null
+  }
+}
+
+// Whether a claude running in `cwd` wrote to one of its transcripts within BUSY_MS.
+// Claude keeps them in ~/.claude/projects/<cwd with all but letters and digits made "-">/.
+const isClaudeBusy = (cwd: string) => {
+  const dir = `${homedir()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}`
+  try {
+    return readdirSync(dir).some(f => f.endsWith('.jsonl') && Date.now() - modifiedAt(`${dir}/${f}`) < BUSY_MS)
+  } catch {
+    return false
+  }
+}
+
+// Every coding agent running and the folder it runs in, read from /proc; none where there is no /proc.
+// An agent started by another of its kind, such as a helper process, is left out.
+const findAgents = () => {
+  let pids: string[]
+  try {
+    pids = readdirSync('/proc').filter(p => /^\d+$/.test(p))
+  } catch {
+    return []
+  }
+  const found = pids.flatMap(pid => {
+    const name = agentOf(pid)
+    if (!name) return []
+    try {
+      // The parent's pid is the second field after the name, which ends at the last ")".
+      const parent = Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop()!.split(' ')[1])
+
+      return [{ name, pid: Number(pid), parent, cwd: readlinkSync(`/proc/${pid}/cwd`) }]
+    } catch {
+      return []
+    }
+  })
+  const ids = new Set(found.map(a => a.pid))
+  const busy = new Map<string, boolean>()
+
+  return found
+    .filter(a => !ids.has(a.parent))
+    .map(({ name, pid, cwd }): Agent & { cwd: string } => {
+      if (name !== 'claude') return { name, pid, cwd }
+      if (!busy.has(cwd)) busy.set(cwd, isClaudeBusy(cwd))
+
+      return { name, pid, cwd, isBusy: busy.get(cwd) }
+    })
 }
 
 // ---- Formatting ----
@@ -579,6 +659,16 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     const open = isOpen(key, true)
     const name = label(tree)
     const parts: { text: string; color?: string }[] = []
+    // Its agents, alike ones counted together: a busy claude green, an idle one dim, the rest cyan.
+    const kinds = new Map<string, { agent: Agent; count: number }>()
+    for (const agent of tree.agents) {
+      const kind = `${agent.name}\t${agent.isBusy}`
+      kinds.set(kind, { agent, count: (kinds.get(kind)?.count ?? 0) + 1 })
+    }
+    for (const { agent, count } of kinds.values()) {
+      const text = `${agent.isBusy === false ? '○' : '●'} ${count > 1 ? `${count} ` : ''}${agent.name}`
+      parts.push({ text, color: agent.isBusy ? 'green' : agent.isBusy === undefined ? 'cyan' : undefined })
+    }
     if (tree.isBase) parts.push({ text: 'base' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind`, color: 'yellow' })
