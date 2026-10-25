@@ -235,11 +235,13 @@ type Tree = {
 }
 
 // A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
-// for the person (its turn done, or asking leave to run a tool), and what it last said or asks to run.
-type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; says?: string }
+// for the person (its turn done, or asking leave to run a tool), what it last said or asks to run,
+// and while busy when its turn began, ms since the epoch.
+type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; says?: string; turnAt?: number }
 
-// How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working.
-type Ending = { kind: 'done' | 'tool' | 'stopped' | 'working'; at: number; tool?: string; says: string }
+// How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working;
+// `turnAt` when the person last prompted it, 0 when that is not in the part read.
+type Ending = { kind: 'done' | 'tool' | 'stopped' | 'working'; at: number; tool?: string; says: string; turnAt: number }
 
 // A tmux pane: its id, its window as "session:index", that window's name, what it runs, and its first process.
 type Pane = { id: string; window: string; windowName: string; command: string; pid: number }
@@ -855,15 +857,18 @@ const readEnding = (file: string, at: number): Ending | null => {
   // What it said last, in one line.
   const said = conversation.findLast(e => e.type === 'assistant' && blocks(e).some(b => b.type === 'text' && b.text?.trim()))
   const says = (said ? blocks(said).filter(b => b.type === 'text').map(b => b.text).join(' ') : '').replace(/\s+/g, ' ').trim()
+  // The person's last prompt, which began the turn: a user entry that is not a tool's result.
+  const prompted = conversation.findLast(e => e.type === 'user' && !blocks(e).some(b => b.type === 'tool_result'))
+  const turnAt = Date.parse(prompted?.timestamp ?? '') || 0
   let ending: Ending | null = null
   if (last) {
     const when = Date.parse(last.timestamp ?? '') || at
     const tool = last.type === 'assistant' ? blocks(last).findLast(b => b.type === 'tool_use') : undefined
     const text = blocks(last).find(b => b.type === 'text')?.text ?? ''
-    if (tool) ending = { kind: 'tool', at: when, tool: tool.name, says: `wants ${tool.name}: ${toolSubject(tool.input)}`.replace(/\s+/g, ' ').trim() }
-    else if (last.type === 'assistant' && last.message?.stop_reason && last.message.stop_reason !== 'tool_use') ending = { kind: 'done', at: when, says }
-    else if (last.type === 'user' && text.startsWith('[Request interrupted')) ending = { kind: 'stopped', at: when, says }
-    else ending = { kind: 'working', at: when, says }
+    if (tool) ending = { kind: 'tool', at: when, tool: tool.name, says: `wants ${tool.name}: ${toolSubject(tool.input)}`.replace(/\s+/g, ' ').trim(), turnAt }
+    else if (last.type === 'assistant' && last.message?.stop_reason && last.message.stop_reason !== 'tool_use') ending = { kind: 'done', at: when, says, turnAt }
+    else if (last.type === 'user' && text.startsWith('[Request interrupted')) ending = { kind: 'stopped', at: when, says, turnAt }
+    else ending = { kind: 'working', at: when, says, turnAt }
   }
   endings.set(file, { at, ending })
 
@@ -903,7 +908,7 @@ const hasChildSince = (pid: number, since: number) => {
 }
 
 // What a claude in `cwd` is up to, from how its newest transcript ends.
-const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'says'> => {
+const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'says' | 'turnAt'> => {
   const transcript = newestTranscript(cwd)
   if (!transcript) return { isBusy: false }
   const ending = readEnding(transcript.file, transcript.at)
@@ -915,11 +920,12 @@ const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaitin
     return { isBusy: false, isWaiting, says: ending.says || undefined }
   }
   if (ending.kind === 'stopped') return { isBusy: false, says: ending.says || undefined }
-  if (ending.kind === 'working') return { isBusy: quiet < THINKING_MS }
+  const turnAt = ending.turnAt || undefined
+  if (ending.kind === 'working') return quiet < THINKING_MS ? { isBusy: true, turnAt } : { isBusy: false }
   // A tool call: running, unless it has sat a while with nothing started for it, as it waits for leave to run.
   const isRunning = quiet < ASKING_MS || LONG_TOOLS.includes(ending.tool ?? '') || ending.tool?.startsWith('mcp__') || hasChildSince(pid, ending.at)
 
-  return isRunning ? { isBusy: true } : { isBusy: false, isWaiting: true, says: ending.says }
+  return isRunning ? { isBusy: true, turnAt } : { isBusy: false, isWaiting: true, says: ending.says }
 }
 
 // A process's parent, or 0 when it is gone. The parent's pid is the second field after the name, which ends at the last ")".
@@ -1731,6 +1737,8 @@ const buildRows = (
     if (waiting.length > 0) parts.push({ text: `◆ ${names(waiting)} waiting`, color: 'yellow' })
     if (busy.length > 0) parts.push({ text: `● ${names(busy)}`, color: 'green' })
     if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
+    // How long each busy agent has been at its current turn.
+    for (const agent of busy.filter(a => a.turnAt)) details.push({ text: `${agent.name} working ${duration(Date.now() - agent.turnAt!)}` })
     // What each agent not at work last said, or asks to run, so it can be read without going there.
     for (const agent of tree.agents.filter(a => a.says && !a.isBusy)) {
       details.push({ text: agent.says!.length > 60 ? `${agent.says!.slice(0, 59)}…` : agent.says! })
