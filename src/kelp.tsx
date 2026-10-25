@@ -1205,6 +1205,18 @@ const newLineNumbers = (lines: string[]) => {
   })
 }
 
+// The header starts with kelp's name and then each tab's, one space apart.
+const HEADER_LEAD = 'kelp  '
+const TABS: Tab[] = ['worktrees', 'repo']
+
+// The first and last column of a tab's name in the header, counted from 1 as mouse reports count them,
+// so a click finds the tab whatever the names are.
+const tabColumns = (name: Tab) => {
+  const from = HEADER_LEAD.length + TABS.slice(0, TABS.indexOf(name)).reduce((n, t) => n + t.length + 1, 0) + 1
+
+  return [from, from + name.length - 1]
+}
+
 // The orders `s` steps through, the first the default, and how the header names each.
 const SORTS: Sort[] = ['name', 'recent', 'attention']
 const SORT_NAMES: Record<Sort, string> = { name: 'by name', recent: 'by recent activity', attention: 'needing attention first' }
@@ -2062,9 +2074,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (base === 64) return scroll(-WHEEL_LINES)
     if (base === 65) return scroll(WHEEL_LINES)
     if (base !== 0) return
-    // The header reads "kelp  worktrees repo": worktrees in columns 7 to 15, repo in 17 to 20.
-    if (line === 1 && column >= 7 && column <= 15) return switchTab('worktrees')
-    if (line === 1 && column >= 17 && column <= 20) return switchTab('repo')
+    const tabHit = line === 1 ? TABS.find(t => column >= tabColumns(t)[0] && column <= tabColumns(t)[1]) : undefined
+    if (tabHit) return switchTab(tabHit)
     // The header is the first line, so the rows start on the second.
     const clicked = rows[top + line - 2]
     if (line < 2 || line - 2 >= height || !clicked || clicked.isGap) return
@@ -2529,7 +2540,13 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const changed = files ? Object.keys(files.status).length : 0
   const header = (
     <Text wrap="truncate-end">
-      <Text bold>kelp</Text>  {tabName('worktrees')} {tabName('repo')}
+      <Text bold>{HEADER_LEAD}</Text>
+      {TABS.map((t, k) => (
+        <Text key={t}>
+          {k > 0 && ' '}
+          {tabName(t)}
+        </Text>
+      ))}
       {filters[tab] && <Text color="yellow">  /{filters[tab]}</Text>}
       {tab === 'worktrees' && repo && (
         <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}{sort !== SORTS[0] && ` · ${SORT_NAMES[sort]}`}</Text>
