@@ -114,6 +114,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['n', 'new worktree: asks for a branch'],
       ['x', 'remove the worktree, and its branch when merged (twice)'],
       ['X', 'remove it even with uncommitted changes or unmerged commits (twice)'],
+      ['C', 'clean up: prune missing worktrees, remove clean merged ones (twice)'],
     ],
   },
   {
@@ -1282,6 +1283,13 @@ const planRemoval = (tree: Tree, repo: Repo, root: string, isForce: boolean) => 
 
   return { ask: `Remove ${name}${losing}${branch}`, isBranchGone }
 }
+
+// What C cleans up: the missing worktrees git can prune, as locked ones it keeps, and every merged worktree
+// x would remove without forcing, so never the main one, the base's, kelp's own or one an agent works in.
+const planCleanup = (repo: Repo, root: string) => ({
+  missing: repo.trees.filter(t => t.isMissing && !t.isLocked),
+  merged: repo.trees.filter(t => t.isMerged && typeof planRemoval(t, repo, root, false) !== 'string'),
+})
 
 // ---- Formatting ----
 
@@ -2550,6 +2558,45 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
+  // Cleans up on a second press of C: prunes the missing worktrees, then removes each clean, merged one and its branch.
+  const cleanUp = () => {
+    if (!repo) return
+    const { missing, merged } = planCleanup(repo, root)
+    if (missing.length + merged.length === 0) return setNotice(`Nothing to clean up: no missing worktrees, and none clean and merged into ${repo.base}.`)
+    const prune = missing.length > 0 ? `prune ${plural(missing.length, 'missing worktree')}` : ''
+    const remove = merged.length > 0 ? `remove ${merged.map(label).join(', ')} with ${merged.length === 1 ? 'its branch' : 'their branches'}, merged into ${repo.base}` : ''
+    const ask = [prune, remove].filter(Boolean).join(', and ')
+
+    confirm('C', `${ask[0].toUpperCase()}${ask.slice(1)}`, async () => {
+      const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
+      setNotice('Cleaning up…')
+      const failures: string[] = []
+      if (missing.length > 0) {
+        const failed = await gitDo(main, ['worktree', 'prune'])
+        if (failed) failures.push(`prune: ${failed}`)
+      }
+      const removed: string[] = []
+      for (const tree of merged) {
+        const failed = await gitDo(main, ['worktree', 'remove', tree.path])
+        if (failed) {
+          failures.push(`${label(tree)}: ${failed}`)
+          continue
+        }
+        removed.push(label(tree))
+        setJob(tree.path)
+        // Checked again, as the branch may have moved since the first press.
+        if ((await git(main, ['merge-base', '--is-ancestor', tree.branch, repo.base])) !== null) await gitDo(main, ['branch', '-D', tree.branch])
+      }
+      await refresh.current()
+      const done = [
+        missing.length > 0 && !failures.some(f => f.startsWith('prune')) && `Pruned ${plural(missing.length, 'missing worktree')}`,
+        removed.length > 0 && `Removed ${removed.join(', ')}`,
+        failures.length > 0 && `Couldn't: ${failures.join('; ')}`,
+      ]
+      setNotice(`${done.filter(Boolean).join('. ')}.`)
+    })
+  }
+
   // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
   const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
     const p = promptRef.current!
@@ -2698,6 +2745,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     }
     else if (input === 'n' && tab === 'worktrees' && repo) ask('new worktree for branch', createTree)
     else if ((input === 'x' || input === 'X') && tab === 'worktrees') removeTree(input === 'X')
+    else if (input === 'C' && tab === 'worktrees') cleanUp()
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
     else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
     else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)
