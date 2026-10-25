@@ -18,6 +18,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **diffs**: open a file to read its diff
 - **conflicts**: a worktree behind the base branch says whether merging the base in would conflict, its uncommitted edits included, and lists the files that would; open one to see its conflicts as the merge would leave them. Worked out in memory with `git merge-tree`, so nothing in the worktree changes
 - **merging**: `u` on a worktree merges the base branch into it (press it twice). It needs nothing uncommitted; a merge that conflicts stops with the conflicts in the files, which kelp lists until they are resolved and committed, and `U` (twice) aborts it. `m` (twice) goes the other way, merging the worktree's branch into the base branch in the base's own worktree: a fast-forward when it can be, else a merge commit. It needs both worktrees clean and no predicted conflicts, and says why when it won't. `R` (twice) rebases the worktree onto the base instead; a rebase that conflicts stops with them in the files, shown like a merge's. Once every conflict is resolved and `git add`ed, `u` commits the merge or `R` carries the rebase on, and `U` aborts either
+- **sync**: `S` (twice) brings every worktree up to the base branch: one with no commits of its own fast-forwards, one with commits gets the base merged in when no conflict is predicted. Any with uncommitted changes, in the middle of a merge or rebase, or that would conflict are left alone, and one line says what was synced and what was skipped and why
 - **agents**: the coding agents running in each worktree (claude, codex, aider, gemini, opencode, cursor-agent), found from their processes' folders on Linux. A claude shows `●` green while it is working and `○` dim when idle, told by whether it wrote to its transcript in the last 30 seconds
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run
 - **committing**: `c` asks for a message in the footer and commits everything uncommitted in the worktree under the cursor, untracked files included
@@ -48,6 +49,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `m` merge into the base
 - `R` (twice) rebase onto the base, again to carry on once conflicts are resolved
 - `U` abort a merge
+- `S` (twice) sync every worktree with the base
 - `!` run a command in the worktree
 - `:` run one of its named commands (.kelp.json or package.json scripts)
 - `K` (twice) stop the command running there
