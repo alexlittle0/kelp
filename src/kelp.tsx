@@ -682,7 +682,7 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
     treeAt(trees, cwd)?.agents.push(rest)
   }
   for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
-  for (const { path, port } of findListening(trees)) {
+  for (const { path, port } of await findListening(trees)) {
     const tree = trees.find(t => t.path === path)!
     if (!tree.ports.includes(port)) tree.ports.push(port)
   }
@@ -1175,8 +1175,9 @@ const listeningSockets = () => {
 }
 
 // The ports that processes in each of `trees` listen on: each process whose folder is in one, and the listening
-// sockets among its open files. None where there is no /proc, or for another user's processes.
-const findListening = (trees: { path: string }[]) => {
+// sockets among its open files. Where there is no /proc, as on macOS, lsof tells. None for another user's processes.
+const findListening = async (trees: { path: string }[]) => {
+  if (!existsSync('/proc/net/tcp')) return findListeningByLsof(trees)
   const sockets = listeningSockets()
   if (sockets.size === 0) return []
   let pids: string[]
@@ -1203,6 +1204,28 @@ const findListening = (trees: { path: string }[]) => {
     } catch {
       return []
     }
+  })
+}
+
+// The same from lsof: the processes with a TCP socket listening at localhost, as "p<pid>" lines each followed by
+// "n<address>:<port>" ones, then those processes' folders. None when lsof is missing.
+const findListeningByLsof = async (trees: { path: string }[]) => {
+  const listening = await runCommand('/', ['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'])
+  const ports = new Map<string, number[]>()
+  let pid = ''
+  for (const line of (listening?.out ?? '').split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1)
+    const found = line.match(/^n(\*|localhost|127\.[\d.]+|\[::1?\]):(\d+)$/)
+    if (found && pid) ports.set(pid, [...(ports.get(pid) ?? []), Number(found[2])])
+  }
+  if (ports.size === 0) return []
+  const cwds = await runCommand('/', ['lsof', '-a', '-d', 'cwd', '-p', [...ports.keys()].join(','), '-Fn'])
+
+  return (cwds?.out ?? '').split('\n').flatMap(line => {
+    if (line.startsWith('p')) pid = line.slice(1)
+    const tree = line.startsWith('n') ? treeAt(trees, line.slice(1)) : undefined
+
+    return tree ? (ports.get(pid) ?? []).map(port => ({ path: tree.path, port })) : []
   })
 }
 
