@@ -59,6 +59,9 @@ const BUSY_MS = 30_000
 const ASKING_MS = 5000
 // A claude done with its turn counts as waiting for this long, then only as idle.
 const WAITING_MS = 60 * 60_000
+// A claude whose transcript ends on a prompt or a tool's result is waiting on its model, quietly while it thinks;
+// past this long something went wrong, and it counts as idle.
+const THINKING_MS = 10 * 60_000
 // How much of the end of a claude transcript is read.
 const TRANSCRIPT_TAIL = 256 * 1024
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
@@ -861,7 +864,7 @@ const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaitin
     return { isBusy: false, isWaiting, says: ending.says || undefined }
   }
   if (ending.kind === 'stopped') return { isBusy: false, says: ending.says || undefined }
-  if (ending.kind === 'working') return { isBusy: isRecent }
+  if (ending.kind === 'working') return { isBusy: quiet < THINKING_MS }
   // A tool call: running, unless it has sat a while with nothing started for it, as it waits for leave to run.
   const isRunning = quiet < ASKING_MS || LONG_TOOLS.includes(ending.tool ?? '') || ending.tool?.startsWith('mcp__') || hasChildSince(pid, ending.at)
 
@@ -2029,6 +2032,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     let isAgain = false
     let seen = ''
     let seenFiles = ''
+    // Whether each agent, by pid, waited for the person at the last refresh; null before the first.
+    let wasWaiting: Map<number, boolean> | null = null
     refresh.current = async () => {
       if (isBusy) {
         isAgain = true
@@ -2037,6 +2042,16 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       isBusy = true
       try {
         const [found, listed] = await Promise.all([loadRepo(root), tabRef.current === 'repo' ? loadFiles(root) : undefined])
+        // An agent that starts waiting rings the bell, once, and says so; not one already waiting when kelp starts.
+        const agents = (found?.trees ?? []).flatMap(t => t.agents.map(agent => ({ agent, tree: t })))
+        const started = agents.filter(({ agent }) => agent.isWaiting && wasWaiting?.get(agent.pid) === false)
+        wasWaiting = new Map(agents.map(({ agent }) => [agent.pid, agent.isWaiting === true]))
+        if (started.length > 0) {
+          process.stdout.write('\x07')
+          const { agent, tree } = started[0]
+          const others = started.length > 1 ? `, and ${started.length - 1} more` : ''
+          setNotice(`◆ ${agent.name} in ${label(tree)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''}${others}`)
+        }
         const text = JSON.stringify(found)
         if (text !== seen) {
           seen = text
