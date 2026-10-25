@@ -36,7 +36,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **commands**: press `:` to run one of the worktree's named commands, by typing its name or the start of it. They come from `"commands"` in a `.kelp.json` at the repository's root, such as `{ "commands": { "test": "bun test", "dev": "bun run dev" } }`, or, without one, from package.json's scripts
 - **run**: press `!` to run a shell command in the worktree under the cursor (in the repo tab, the one explored). The end of its output streams in under the worktree with its exit code and how long it took, and the worktree's line shows how it is doing. Several can run at once, in different worktrees, while you keep using kelp
 - **filter**: `/` narrows the tab as you type, fzf style (letters in order, any case, each word matched on its own): worktrees by branch, folder or the names of the files they change, the repo tab by file path with the folders holding the matches opened. `⏎` keeps the filter, `esc` drops it
-- **remembers**: the tab, the rows opened, each tab's cursor and filter, and files or diffs in the repo tab come back after a restart, kept in `~/.cache/kelp/` for each repository
+- **remembers**: the tab, the rows opened, each tab's cursor and filter, the order of the worktrees, and files or diffs in the repo tab come back after a restart, kept in `~/.cache/kelp/` for each repository
 
 Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists them all):
 
@@ -66,6 +66,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `e` open the file or worktree in `$EDITOR`
 - `w` switch to the worktree: quit and cd there
 - `/` filter, `esc` clear it
+- `s` order the worktrees by name, recent activity, or needing attention first (conflicts, a busy agent, uncommitted changes)
 - `r` refresh
 - `?` list every key
 - `q` quit
