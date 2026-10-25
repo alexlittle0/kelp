@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
@@ -20,6 +20,10 @@ const MAX_FILE_LINES = 2000
 const MAX_REPO_FILES = 20_000
 // How long a message, such as where a file was opened, stays in the footer.
 const NOTICE_MS = 4000
+// How long kelp waits after the last change before saving what it remembers.
+const SAVE_MS = 500
+// Opened or closed rows remembered at most, the latest kept.
+const MAX_TOGGLED = 1000
 // Lines of a command's output kept, and shown under its worktree.
 const RUN_KEEP = 200
 const RUN_LINES = 12
@@ -219,6 +223,10 @@ type Wanted = { key: string; tree: string; file: string; commit?: string; isUntr
 type Diff = { lines: string[]; colors?: (string | undefined)[]; isCut: boolean; isUnreadable?: boolean; version: number }
 
 type Tab = 'worktrees' | 'repo'
+
+// What kelp remembers across restarts: the tab, the rows opened or closed against how they start,
+// each tab's cursor and filter, and whether the repo tab shows diffs.
+type Saved = { tab: Tab; toggled: string[]; cursors: Record<Tab, string>; filters: Record<Tab, string>; isDiff: boolean }
 
 // A one-line question asked in the footer, such as a new branch's name: what it asks, what is typed so far,
 // and what is done with the answer once ⏎ is pressed.
@@ -1650,13 +1658,51 @@ const planFor = (action: Action, tree: Tree, repo: Repo): Step | string => {
   }
 }
 
+// ---- Saved state ----
+
+// Where kelp remembers the repository holding `root`: ~/.cache/kelp/<hash>.json, the hash of git's own folder,
+// which every worktree of the repository shares. Outside a repository, the hash of `root` itself.
+const stateFile = (root: string) => {
+  let dir = root
+  try {
+    const run = Bun.spawnSync(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: root, stdout: 'pipe', stderr: 'ignore' })
+    if (run.exitCode === 0) dir = run.stdout.toString().trim()
+  } catch {
+    // No git: keyed by the folder.
+  }
+  const cache = process.env.XDG_CACHE_HOME || `${homedir()}/.cache`
+
+  return `${cache}/kelp/${Bun.hash(dir).toString(16)}.json`
+}
+
+// What was saved, or nothing when there is no file or it can't be read.
+const loadSaved = (file: string): Partial<Saved> => {
+  try {
+    const saved = JSON.parse(readFileSync(file, 'utf8'))
+
+    return typeof saved === 'object' && saved !== null ? saved : {}
+  } catch {
+    return {}
+  }
+}
+
+// Saves quietly: a cache that can't be written only means starting afresh next time.
+const save = (file: string, saved: Saved) => {
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify(saved))
+  } catch {
+    // Nothing to do.
+  }
+}
+
 // ---- View ----
 
-const App = ({ root }: { root: string }) => {
+const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const [size, setSize] = useState({ columns: stdout.columns, rows: stdout.rows })
-  const [tab, setTab] = useState<Tab>('worktrees')
+  const [tab, setTab] = useState<Tab>(saved.tab === 'repo' ? 'repo' : 'worktrees')
   const [repo, setRepo] = useState<Repo | null | undefined>(undefined)
   // The repo tab's files, read only while it is shown.
   const [files, setFiles] = useState<Files | null | undefined>(undefined)
@@ -1664,11 +1710,11 @@ const App = ({ root }: { root: string }) => {
   const [version, setVersion] = useState(0)
   const [updatedAt, setUpdatedAt] = useState(0)
   // The rows opened or closed against how they start, in either tab.
-  const [toggled, setToggled] = useState(new Set<string>())
+  const [toggled, setToggled] = useState(new Set<string>(Array.isArray(saved.toggled) ? saved.toggled : []))
   // Diffs and, in the repo tab, whole files, by the row they sit under.
   const [diffs, setDiffs] = useState(new Map<string, Diff>())
   // Whether the repo tab shows an open file or its diff against HEAD.
-  const [isDiff, setIsDiff] = useState(false)
+  const [isDiff, setIsDiff] = useState(saved.isDiff === true)
   const [notice, setNotice] = useState('')
   // What kelp is doing to each worktree, by its folder.
   const [jobs, setJobs] = useState(new Map<string, Job>())
@@ -1691,9 +1737,9 @@ const App = ({ root }: { root: string }) => {
   // Whether `?`'s list of keys covers the rows.
   const [isHelp, setIsHelp] = useState(false)
   // Each tab's `/` filter, '' for none.
-  const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
+  const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '', ...saved.filters })
   // Each tab keeps its own cursor and scroll.
-  const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
+  const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '', ...saved.cursors })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
   const [, redraw] = useState(0)
   const tops = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0 })
@@ -1705,6 +1751,14 @@ const App = ({ root }: { root: string }) => {
   // The pull requests by branch, fetched from GitHub on their own slower clock so they never hold up a refresh.
   const [prs, setPrs] = useState(new Map<string, Pr>())
   const fetchPrs = useRef(async () => {})
+
+  // Remembers the view a moment after it last changed, and on quitting, so a restart opens it as it was.
+  useEffect(() => {
+    latest = { tab, toggled: [...toggled].slice(-MAX_TOGGLED), cursors, filters, isDiff }
+    const timer = setTimeout(() => latest && save(STATE_FILE, latest), SAVE_MS)
+
+    return () => clearTimeout(timer)
+  }, [tab, toggled, cursors, filters, isDiff])
 
   useEffect(() => {
     const onResize = () => setSize({ columns: stdout.columns, rows: stdout.rows })
@@ -2349,11 +2403,15 @@ const App = ({ root }: { root: string }) => {
 // ---- Main ----
 
 const root = resolve(process.argv[2] ?? process.cwd())
+const STATE_FILE = stateFile(root)
+// The view as it last was, saved once more on quitting.
+let latest: Saved | undefined
 // The alternate screen, so quitting gives the terminal back as it was,
 // and mouse reports in SGR form: clicks and the wheel, not plain movement.
 process.stdout.write('\x1b[?1049h\x1b[H\x1b[?1000h\x1b[?1006h')
-const app = render(<App root={root} />)
+const app = render(<App root={root} saved={loadSaved(STATE_FILE)} />)
 await app.waitUntilExit()
+if (latest) save(STATE_FILE, latest)
 // Commands still running, such as dev servers, end with kelp.
 for (const run of runs.values()) if (isRunning(run)) stopRun(run)
 process.stdout.write('\x1b[?1006l\x1b[?1000l\x1b[?1049l')
