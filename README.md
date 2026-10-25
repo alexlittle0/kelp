@@ -34,6 +34,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `tab`, `1`/`2` or a click on its name switch tab
 - `d` file or diff (repo tab)
 - `o` open in nvim at the line under the cursor
+- `t` jump to the worktree in tmux, or open a window there
 - `n` new worktree
 - `u` merge the base in
 - `m` merge into the base
@@ -44,6 +45,5 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `r` refresh
 - `?` list every key
 - `q` quit
-Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `t` jump to the worktree in tmux, `u` merge the base in, `U` abort a merge, `!` run a command in the worktree, `r` refresh, `?` list every key, `q` quit.
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.

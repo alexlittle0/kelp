@@ -1675,9 +1675,6 @@ const App = ({ root }: { root: string }) => {
     setNotice(`Created ${branch} at ${shortPath(path)}`)
   }
 
-  // The worktree the cursor is in: the one whose line it is on or under, or in the repo tab the one explored.
-  const treeUnder = () => repo?.trees.find(t => (tab === 'repo' ? files?.dir === t.path : row?.key.split('\t')[1] === t.path))
-
   // The uncommitted file the cursor is on or in the diff of: its worktree's folder, its path there, and whether git tracks it.
   const uncommittedUnder = () => {
     const at = row && (row.canOpen ? row : parentOf(row))
