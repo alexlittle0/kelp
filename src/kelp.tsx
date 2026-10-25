@@ -17,6 +17,9 @@ const MAX_COMMITS = 50
 const MAX_FILE = 1_000_000
 // Lines of a file the repo tab shows before cutting it.
 const MAX_FILE_LINES = 2000
+// Columns a tab stop is apart in shown code, and the characters of a line of code kept, the rest cut with "…".
+const TAB_WIDTH = 4
+const MAX_LINE = 500
 // Files the repo tab lists at most.
 const MAX_REPO_FILES = 20_000
 // How long a message, such as where a file was opened, stays in the footer.
@@ -441,6 +444,17 @@ const readText = (file: string) => {
 // A text's lines; a final newline ends the last line rather than starting another.
 const toLines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
 
+// A line of code as it is shown: tabs out to the next tab stop, a Windows line ending dropped, other control
+// characters, which would upset the terminal, as "·", and a very long line, such as minified code, cut.
+const cleanLine = (line: string) => {
+  let text = ''
+  for (const c of line.replace(/\r$/, '').slice(0, MAX_LINE)) {
+    text += c === '\t' ? ' '.repeat(TAB_WIDTH - (text.length % TAB_WIDTH)) : c < ' ' || c === '\x7f' ? '·' : c
+  }
+
+  return line.length > MAX_LINE ? `${text}…` : text
+}
+
 // A text file's line count, or null when it is binary, too large or unreadable.
 const countLines = (file: string) => {
   const text = readText(file)
@@ -668,7 +682,7 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
 // is blue, the base's magenta, and the common ancestor's (with merge.conflictStyle diff3) dim.
 const readConflict = async (want: Wanted, conflict: Conflict) => {
   const text = conflict.merged ? await git(want.tree, ['cat-file', 'blob', `${conflict.merged}:${want.file}`]) : readText(`${want.tree}/${want.file}`)
-  const all = (text ?? '').replace(/\n$/, '').split('\n')
+  const all = (text ?? '').replace(/\n$/, '').split('\n').map(cleanLine)
   const kept = new Set<number>()
   let start = -1
   all.forEach((line, n) => {
@@ -721,7 +735,8 @@ const readDiff = async (want: Wanted): Promise<Omit<Diff, 'version'>> => {
       : await git(want.tree, ['diff', 'HEAD', '--no-renames', '--', want.file])
   const lines = (text ?? '').replace(/\n$/, '').split('\n')
   const from = lines.findIndex(l => l.startsWith('@@'))
-  const body = (from === -1 ? [] : lines.slice(from)).slice(0, MAX_DIFF_LINES)
+  // Each line's code cleaned after its sign, so tab stops line up with the code.
+  const body = (from === -1 ? [] : lines.slice(from)).slice(0, MAX_DIFF_LINES).map(l => (l.startsWith('@@') ? cleanLine(l) : l.slice(0, 1) + cleanLine(l.slice(1))))
   const isCut = from !== -1 && lines.length - from > MAX_DIFF_LINES
 
   return { lines: body, tokens: highlightDiff(body, languageOf(want.file, readFirstLine(`${want.tree}/${want.file}`))), isCut }
@@ -733,7 +748,7 @@ const readView = async (want: Wanted) => {
   const text = readText(`${want.tree}/${want.file}`)
   if (text === null) return { lines: [], isCut: false, isUnreadable: true }
   const all = toLines(text)
-  const lines = all.slice(0, MAX_FILE_LINES).map(l => l.replace(/\t/g, '    '))
+  const lines = all.slice(0, MAX_FILE_LINES).map(cleanLine)
 
   return { lines, tokens: highlight(lines, languageOf(want.file, lines[0])), isCut: all.length > MAX_FILE_LINES }
 }
