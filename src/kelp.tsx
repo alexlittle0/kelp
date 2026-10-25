@@ -166,6 +166,9 @@ type Tree = {
   isMain: boolean
   ahead: number
   behind: number
+  // Whether its branch is fully in the base after commits of its own, so it is safe to remove;
+  // a branch made but never committed to is not.
+  isMerged: boolean
   commits: Commit[]
   uncommitted: Change[]
   // Merging the base in, worked out in memory: the merged tree ('' when not worked out, as nothing is behind
@@ -474,6 +477,9 @@ const loadTree = async (w: { path: string; head: string; branch: string; isMain:
     readRebase(w.path),
   ])
   const [behind, ahead] = (counts ?? '0\t0').trim().split(/\s+/).map(Number)
+  // The branch's reflog says whether anything was ever committed to it.
+  const reflog = !isBase && ahead === 0 && w.branch ? await git(w.path, ['reflog', 'show', '--format=%gs', `refs/heads/${w.branch}`]) : null
+  const isMerged = (reflog ?? '').split('\n').some(l => l.startsWith('commit'))
   const isMerging = mergeHead !== null
   const { merged, conflicts } = behind > 0 && !isMerging && !rebase ? await readConflicts(w.path, base, uncommitted.length > 0) : { merged: '', conflicts: [] }
   const edited = uncommitted.map(c => modifiedAt(`${w.path}/${c.path}`))
@@ -484,6 +490,7 @@ const loadTree = async (w: { path: string; head: string; branch: string; isMain:
     isBase,
     ahead,
     behind,
+    isMerged,
     commits: parseLog(log ?? ''),
     uncommitted,
     merged,
@@ -1353,6 +1360,8 @@ const buildRows = (
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind` })
+    // Fully in the base: safe to remove.
+    if (tree.isMerged) parts.push({ text: 'merged' })
     // Where it stands against its remote branch; nothing when the repository has no remote.
     if (!tree.isUpstreamGone) {
       if (tree.unpushed > 0 || tree.unpulled > 0) {
