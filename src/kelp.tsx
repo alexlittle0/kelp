@@ -2837,7 +2837,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const [size, setSize] = useState({ columns: stdout.columns, rows: stdout.rows })
-  const [tab, setTab] = useState<Tab>(saved.tab === 'repo' ? 'repo' : 'worktrees')
+  const [tab, setTab] = useState<Tab>(TABS.find(t => t === saved.tab) ?? 'worktrees')
   const [repo, setRepo] = useState<Repo | null | undefined>(undefined)
   // The repo tab's files, read only while it is shown.
   const [files, setFiles] = useState<Files | null | undefined>(undefined)
