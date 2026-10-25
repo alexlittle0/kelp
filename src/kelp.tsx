@@ -1281,62 +1281,59 @@ const buildRows = (
     // Worktrees start closed, one line each; a blank line sets one apart only after one left open.
     if (rows.length > 0 && rows[rows.length - 1].depth > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
     const open = isOpen(key, false)
+    // The worktree's line says only what wants a look: trouble in red, then work under way, then how far it has come.
+    // The rest waits in its details line, shown when it is open.
     const parts: { text: string; color?: string }[] = []
+    const details: { text: string; color?: string }[] = []
+    const unresolved = tree.uncommitted.filter(c => c.tag === 'conflict').length
+    if (tree.isMerging || tree.isRebasing) {
+      parts.push({ text: tree.isMerging ? `merging ${repo.base}` : `rebasing${tree.rebaseStep ? ` ${tree.rebaseStep}` : ''}`, color: 'red' })
+      const next = tree.isMerging ? 'u commits it' : 'R carries on'
+      parts.push(unresolved > 0 ? { text: `⚠ ${unresolved} unresolved`, color: 'red' } : { text: `resolved, ${next}`, color: 'green' })
+    } else if (tree.conflicts.length > 0) {
+      parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'}`, color: 'red' })
+    } else if (tree.merged) details.push({ text: `merges ${repo.base} in cleanly` })
+    if (tree.isUpstreamGone) parts.push({ text: 'upstream gone', color: 'red' })
+    // Its pull request: failing checks or asked-for changes on the line, the rest in the details.
+    const pr = tree.isBase ? undefined : prs.get(tree.branch)
+    const isPrOpen = pr?.state === 'open' || pr?.state === 'draft'
+    if (pr && isPrOpen && pr.checks === 'failing') parts.push({ text: `#${pr.number} checks failing`, color: 'red' })
+    else if (pr && isPrOpen && pr.review === 'changes requested') parts.push({ text: `#${pr.number} changes requested`, color: 'red' })
+    else if (pr) {
+      details.push({ text: `#${pr.number} ${pr.state}`, color: PR_COLORS[pr.state] })
+      if (isPrOpen && pr.review) details.push({ text: pr.review, color: pr.review === 'approved' ? 'green' : undefined })
+      if (isPrOpen && pr.checks) details.push(CHECK_PARTS[pr.checks])
+    }
+    // A running command, and its address once it says one, in the details.
     const run = runs.get(tree.path)
     if (run) {
       const state = runState(run)
       const what = run.command.length > 16 ? `${run.command.slice(0, 15)}…` : run.command
-      parts.push({ text: `${state.mark} ${what}${isRunning(run) ? ` ${duration(Date.now() - run.startedAt)}` : ''}`, color: state.color })
-      if (isRunning(run) && run.url) parts.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
+      if (isRunning(run) || run.code !== 0) parts.push({ text: `${state.mark} ${what}`, color: state.color })
+      if (isRunning(run) && run.url) details.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
-    // Its agents, alike ones counted together: a busy claude green, an idle one dim, the rest cyan.
-    const kinds = new Map<string, { agent: Agent; count: number }>()
-    for (const agent of tree.agents) {
-      const kind = `${agent.name}\t${agent.isBusy}`
-      kinds.set(kind, { agent, count: (kinds.get(kind)?.count ?? 0) + 1 })
-    }
-    for (const { agent, count } of kinds.values()) {
-      const text = `${agent.isBusy === false ? '○' : '●'} ${count > 1 ? `${count} ` : ''}${agent.name}`
-      parts.push({ text, color: agent.isBusy ? 'green' : agent.isBusy === undefined ? 'cyan' : undefined })
-    }
-    // Its tmux panes, by what they run.
-    if (tree.panes.length > 0) parts.push({ text: `tmux ${[...new Set(tree.panes.map(p => p.command))].join(', ')}` })
-    if (tree.isBase) parts.push({ text: 'base' })
+    // Its agents: a busy one on the line, the idle ones in the details.
+    const busy = tree.agents.filter(a => a.isBusy !== false)
+    const idle = tree.agents.filter(a => a.isBusy === false)
+    const names = (agents: Agent[]) => [...new Set(agents.map(a => a.name))].join(', ')
+    if (busy.length > 0) parts.push({ text: `● ${names(busy)}`, color: 'green' })
+    if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
+    if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
-    if (tree.behind > 0) parts.push({ text: `${tree.behind} behind`, color: 'yellow' })
-    const unresolved = tree.uncommitted.filter(c => c.tag === 'conflict').length
-    if (tree.isMerging || tree.isRebasing) {
-      parts.push({ text: tree.isMerging ? `merging ${repo.base}` : `rebasing onto ${repo.base}${tree.rebaseStep ? ` ${tree.rebaseStep}` : ''}`, color: 'red' })
-      const next = tree.isMerging ? 'u commits it' : 'R carries on'
-      parts.push(unresolved > 0 ? { text: `⚠ ${unresolved} unresolved`, color: 'red' } : { text: `resolved, ${next}`, color: 'green' })
-    } else if (tree.conflicts.length > 0) {
-      parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'} with ${repo.base}`, color: 'red' })
-    } else if (tree.merged) parts.push({ text: 'merges cleanly' })
-    if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length} uncommitted`, color: 'yellow' })
+    if (tree.behind > 0) parts.push({ text: `${tree.behind} behind` })
     // Where it stands against its remote branch; nothing when the repository has no remote.
-    if (tree.isUpstreamGone) parts.push({ text: 'upstream gone', color: 'red' })
-    else if (tree.unpushed > 0 || tree.unpulled > 0) {
-      parts.push({ text: [tree.unpushed > 0 && `↑${tree.unpushed}`, tree.unpulled > 0 && `↓${tree.unpulled}`].filter(Boolean).join(' '), color: 'cyan' })
-    }
-    else if (tree.upstream) parts.push({ text: 'pushed' })
-    else if (repo.remote && tree.branch) parts.push({ text: 'not pushed', color: 'yellow' })
-    // Its pull request, the review and checks only while it is still open.
-    const pr = tree.isBase ? undefined : prs.get(tree.branch)
-    if (pr) {
-      parts.push({ text: `#${pr.number} ${pr.state}`, color: PR_COLORS[pr.state] })
-      if (pr.state === 'open' || pr.state === 'draft') {
-        if (pr.review) parts.push({ text: pr.review, color: pr.review === 'approved' ? 'green' : pr.review === 'changes requested' ? 'red' : undefined })
-        if (pr.checks) parts.push(CHECK_PARTS[pr.checks])
+    if (!tree.isUpstreamGone) {
+      if (tree.unpushed > 0 || tree.unpulled > 0) {
+        details.push({ text: [tree.unpushed > 0 && `↑${tree.unpushed}`, tree.unpulled > 0 && `↓${tree.unpulled}`].filter(Boolean).join(' '), color: 'cyan' })
       }
+      else if (tree.upstream) details.push({ text: 'pushed' })
+      else if (repo.remote && tree.branch) details.push({ text: 'not pushed' })
     }
-    if (!tree.isBase && tree.ahead === 0 && tree.uncommitted.length === 0) parts.push({ text: 'nothing new' })
+    if (tree.panes.length > 0) details.push({ text: `tmux ${[...new Set(tree.panes.map(p => p.command))].join(', ')}` })
     if (tree.lastAt > 0) parts.push({ text: ago(tree.lastAt) })
     const right = parts.map(p => p.text).join(' · ')
-    // The folder goes first, then the rule, when the line runs short.
     const width = room(0)
-    let where = ` ${fitPath(tree.path, Math.max(8, width - name.length - right.length - 6))}`
-    if (width - 2 - name.length - where.length - right.length - 2 < 1) where = ''
-    const fill = Math.max(1, width - 2 - name.length - where.length - right.length - 2)
+    const fill = Math.max(1, width - 2 - name.length - right.length - 2)
     rows.push({
       key,
       depth: 0,
@@ -1345,7 +1342,7 @@ const buildRows = (
         <Text wrap="truncate-end">
           <Text dimColor>{open ? '▾' : '▸'} </Text>
           <Text bold color={tree.isBase ? undefined : 'blue'}>{name}</Text>
-          <Text dimColor>{`${where} ${'━'.repeat(fill)} `}</Text>
+          <Text dimColor>{` ${'━'.repeat(fill)} `}</Text>
           {parts.map((p, k) => (
             <Text key={k}>
               {k > 0 && <Text dimColor> · </Text>}
@@ -1360,6 +1357,24 @@ const buildRows = (
       rows.push({ key: `${key}\tjob`, parent: key, depth: 1, node: <Text color={job.isFailed ? 'red' : 'cyan'} wrap="truncate-end">{job.text}</Text> })
     }
     if (!open) continue
+
+    // Its folder, then whatever the line left out.
+    rows.push({
+      key: `${key}\tdetails`,
+      parent: key,
+      depth: 1,
+      node: (
+        <Text wrap="truncate-end">
+          <Text dimColor>{shortPath(tree.path)}{tree.isBase ? ' · base' : ''}</Text>
+          {details.map((p, k) => (
+            <Text key={k}>
+              <Text dimColor> · </Text>
+              <Text color={p.color} dimColor={!p.color}>{p.text}</Text>
+            </Text>
+          ))}
+        </Text>
+      ),
+    })
 
     if (pr) {
       const prKey = `${key}\tpr`
@@ -2254,9 +2269,9 @@ const App = ({ root }: { root: string }) => {
         <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
       )}
       {tab === 'worktrees' && conflicting > 0 && (
-        <Text color="red"> · {conflicting} worktree{conflicting === 1 ? '' : 's'} would conflict with {repo?.base}</Text>
+        <Text color="red"> · {conflicting} would conflict</Text>
       )}
-      {tab === 'worktrees' && shared > 0 && <Text color="yellow"> · {shared} file{shared === 1 ? '' : 's'} changed in more than one worktree</Text>}
+      {tab === 'worktrees' && shared > 0 && <Text color="yellow"> · {shared} shared file{shared === 1 ? '' : 's'}</Text>}
       {tab === 'repo' && files && (
         <Text dimColor>  {shortPath(files.dir)} · {files.files.length}{files.isCut ? '+' : ''} files · showing {isDiff ? 'diffs vs HEAD' : 'files'}</Text>
       )}

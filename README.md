@@ -9,7 +9,7 @@ bun src/kelp.tsx [folder]
 
 Run it inside any worktree, or in the folder that holds them. It refreshes every few seconds.
 
-- **worktrees**: each one's branch and folder, how far it is ahead of and behind the base branch, how many files it has uncommitted, and when it last changed
+- **worktrees**: one line each, closed to start, saying only what wants a look: conflicts, a merge or rebase under way, failing checks, a busy agent or a running command, how many files are uncommitted, how far it is ahead of and behind the base branch, and when it last changed. Open one for its folder and the rest (idle agents, tmux panes, upstream, its pull request), its uncommitted files and its commits
 - **upstream**: how far each branch is ahead of (`↑2`) and behind (`↓1`) the remote branch it tracks, or that it is not pushed yet
 - **pull requests**: on a GitHub repository with `gh` installed and logged in, each branch's pull request: its number, whether it is a draft, open, merged or closed, its review decision and whether its checks pass, fail or are still running. Open a worktree to see the PR's title and the checks failing. Fetched with one `gh pr list` in the background every minute, so it never slows the view down
 - **push and PRs**: `p` pushes a worktree's branch, setting its upstream the first time; `P` (twice) pushes it if needed and opens a pull request into the base with `gh pr create --fill`; `b` opens its pull request, or else its branch, on GitHub in the browser
