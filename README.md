@@ -15,6 +15,6 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **diffs**: open a file to read its diff
 - **shared files**: a file changed in more than one worktree says which others change it too
 
-Keys: `↑↓`/`jk` move, `⏎`/space open or close, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `r` refresh, `q` quit.
+Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `r` refresh, `q` quit.
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.

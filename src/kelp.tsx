@@ -14,6 +14,8 @@ const BASE_COMMITS = 5
 const MAX_COMMITS = 50
 // Untracked files over this size are not read for their line count.
 const MAX_UNTRACKED = 1_000_000
+// Lines the view moves per turn of the mouse wheel.
+const WHEEL_LINES = 3
 
 // ---- Types ----
 
@@ -42,8 +44,9 @@ type Repo = { dir: string; base: string; trees: Tree[] }
 type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean }
 type Diff = { lines: string[]; isCut: boolean; version: number }
 
-// One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes.
-type Row = { key: string; parent?: string; depth: number; canOpen?: boolean; node: JSX.Element }
+// One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
+// `isGap` a blank line between worktrees that the cursor passes over.
+type Row = { key: string; parent?: string; depth: number; canOpen?: boolean; isGap?: boolean; node: JSX.Element }
 
 // ---- Git ----
 
@@ -279,20 +282,27 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
   const note = (key: string, parent: string, depth: number, text: string) =>
     rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
 
-  // A group's line, folded or not, filled out with a rule as the sidebar's are.
-  const groupLine = (key: string, parent: string, title: string, count: number, byDefault: boolean) => {
+  // A group's line within a worktree, folded or not: a coloured lead (the commit's hash, or "uncommitted"),
+  // its title, then the dim details. No rule, so only worktree lines carry one.
+  const groupLine = (key: string, parent: string, lead: { text: string; color: string }, title: string, details: string, count: number, byDefault: boolean) => {
     const open = isOpen(key, byDefault)
-    const files = open ? '' : ` (${count} file${count === 1 ? '' : 's'})`
-    const width = room(1)
-    const fits = width - 2 - files.length - 2
+    const files = open ? '' : ` · ${count} file${count === 1 ? '' : 's'}`
+    const meta = `${details}${files}`
+    const fits = room(1) - 2 - lead.text.length - 1 - meta.length - 1
     const name = title.length > fits ? `${title.slice(0, Math.max(1, fits - 1)).trimEnd()}…` : title
-    const text = `${open ? '▾' : '▸'} ${name}${files}`
     rows.push({
       key,
       parent,
       depth: 1,
       canOpen: true,
-      node: <Text dimColor wrap="truncate-end">{`${text} ${'─'.repeat(Math.max(0, width - text.length - 1))}`}</Text>,
+      node: (
+        <Text wrap="truncate-end">
+          <Text dimColor>{open ? '▾' : '▸'} </Text>
+          <Text color={lead.color}>{lead.text}</Text>
+          {name && ` ${name}`}
+          <Text dimColor>{meta}</Text>
+        </Text>
+      ),
     })
 
     return open
@@ -335,6 +345,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
 
   for (const tree of repo.trees) {
     const key = `tree\t${tree.path}`
+    if (rows.length > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
     const open = isOpen(key, true)
     const name = label(tree)
     const parts: { text: string; color?: string }[] = []
@@ -358,7 +369,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
         <Text wrap="truncate-end">
           <Text dimColor>{open ? '▾' : '▸'} </Text>
           <Text bold color={tree.isBase ? undefined : 'blue'}>{name}</Text>
-          <Text dimColor>{`${where} ${'─'.repeat(fill)} `}</Text>
+          <Text dimColor>{`${where} ${'━'.repeat(fill)} `}</Text>
           {parts.map((p, k) => (
             <Text key={k}>
               {k > 0 && <Text dimColor> · </Text>}
@@ -372,13 +383,13 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
 
     if (tree.uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
-      if (groupLine(group, key, 'uncommitted', tree.uncommitted.length, true)) {
+      if (groupLine(group, key, { text: '● uncommitted', color: 'yellow' }, '', '', tree.uncommitted.length, true)) {
         for (const change of tree.uncommitted) fileRows(tree, change, group)
       }
     }
     for (const commit of tree.commits) {
       const group = `${key}\t${commit.hash}`
-      if (groupLine(group, key, `${commit.hash} ${commit.subject} · ${ago(commit.at)}`, commit.files.length, false)) {
+      if (groupLine(group, key, { text: commit.hash, color: 'yellow' }, commit.subject, ` · ${ago(commit.at)}`, commit.files.length, false)) {
         for (const change of commit.files) fileRows(tree, change, group, commit.hash)
         if (commit.files.length === 0) note(`${group}\tnone`, group, 2, 'No file changes.')
       }
@@ -405,6 +416,8 @@ const App = ({ root }: { root: string }) => {
   const [toggled, setToggled] = useState(new Set<string>())
   const [diffs, setDiffs] = useState(new Map<string, Diff>())
   const [cursor, setCursor] = useState('')
+  // Bumped to draw again after the wheel moves `top` and the cursor's row stays the same.
+  const [, redraw] = useState(0)
   const top = useRef(0)
   const lastIndex = useRef(0)
   const pending = useRef(new Set<string>())
@@ -471,7 +484,12 @@ const App = ({ root }: { root: string }) => {
   if (index >= top.current + height) top.current = index - height + 1
   top.current = Math.max(0, Math.min(top.current, rows.length - height))
 
-  const moveTo = (k: number) => rows.length > 0 && setCursor(rows[Math.max(0, Math.min(rows.length - 1, k))].key)
+  // Moves to row `k`, or on past it by `step` when it is a gap.
+  const moveTo = (k: number, step: 1 | -1) => {
+    let at = Math.max(0, Math.min(rows.length - 1, k))
+    while (rows[at]?.isGap) at += step
+    if (rows[at]) setCursor(rows[at].key)
+  }
   const toggle = (key: string) => setToggled(cur => {
     const next = new Set(cur)
     if (!next.delete(key)) next.add(key)
@@ -489,15 +507,42 @@ const App = ({ root }: { root: string }) => {
     if (target !== row) setCursor(target.key)
   }
 
+  // Scrolls the view by `lines`, bringing the cursor along when it would fall off the screen.
+  const scroll = (lines: number) => {
+    top.current = Math.max(0, Math.min(rows.length - height, top.current + lines))
+    if (index < top.current) moveTo(top.current, 1)
+    else if (index >= top.current + height) moveTo(top.current + height - 1, -1)
+    redraw(n => n + 1)
+  }
+
+  // A mouse report: SGR's "[<button;column;line" then M when pressed, m when let go.
+  // A left click puts the cursor on the row and opens or closes it; the wheel scrolls.
+  const onMouse = (button: number, line: number) => {
+    // Shift, alt and ctrl only add to the button's number.
+    const base = button & ~(4 | 8 | 16)
+    if (base === 64) return scroll(-WHEEL_LINES)
+    if (base === 65) return scroll(WHEEL_LINES)
+    if (base !== 0) return
+    // The header is the first line, so the rows start on the second.
+    const clicked = rows[top.current + line - 2]
+    if (line < 2 || line - 2 >= height || !clicked || clicked.isGap) return
+    setCursor(clicked.key)
+    if (clicked.canOpen) toggle(clicked.key)
+  }
+
   useInput((input, key) => {
-    if (input === 'q') exit()
+    const mouse = input.match(/^\[<(\d+);(\d+);(\d+)([Mm])$/)
+    if (mouse) {
+      if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[3]))
+    }
+    else if (input === 'q') exit()
     else if (input === 'r') refresh.current()
-    else if (key.upArrow || input === 'k') moveTo(index - 1)
-    else if (key.downArrow || input === 'j') moveTo(index + 1)
-    else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height)
-    else if (key.pageDown || (key.ctrl && input === 'd')) moveTo(index + height)
-    else if (input === 'g') moveTo(0)
-    else if (input === 'G') moveTo(rows.length - 1)
+    else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
+    else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
+    else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)
+    else if (key.pageDown || (key.ctrl && input === 'd')) moveTo(index + height, 1)
+    else if (input === 'g') moveTo(0, 1)
+    else if (input === 'G') moveTo(rows.length - 1, -1)
     else if (key.return || input === ' ') press()
     else if (key.rightArrow || input === 'l') press(true)
     else if (key.leftArrow || input === 'h') {
@@ -537,7 +582,7 @@ const App = ({ root }: { root: string }) => {
         })}
       </Box>
       <Text dimColor wrap="truncate-end">
-        ↑↓ jk move · ⏎ open/close · ←→ hl in/out · g G ends · r refresh · q quit{updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
+        ↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · wheel scroll · g G ends · r refresh · q quit{updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
       </Text>
     </Box>
   )
@@ -546,8 +591,9 @@ const App = ({ root }: { root: string }) => {
 // ---- Main ----
 
 const root = resolve(process.argv[2] ?? process.cwd())
-// The alternate screen, so quitting gives the terminal back as it was.
-process.stdout.write('\x1b[?1049h\x1b[H')
+// The alternate screen, so quitting gives the terminal back as it was,
+// and mouse reports in SGR form: clicks and the wheel, not plain movement.
+process.stdout.write('\x1b[?1049h\x1b[H\x1b[?1000h\x1b[?1006h')
 const app = render(<App root={root} />)
 await app.waitUntilExit()
-process.stdout.write('\x1b[?1049l')
+process.stdout.write('\x1b[?1006l\x1b[?1000l\x1b[?1049l')
