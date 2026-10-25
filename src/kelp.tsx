@@ -148,6 +148,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['!', 'run a shell command in the worktree'],
       [':', 'run one of its commands: .kelp.json or package.json'],
       ['K', 'stop the command running in the worktree (twice), or clear one that ended'],
+      ['B', 'open the worktree\'s dev server in the browser'],
     ],
   },
   {
@@ -2669,6 +2670,28 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     exit()
   }
 
+  // The page of the dev server in the worktree: the address its command printed when it serves that port, else the port
+  // it serves (its own $PORT first), else the address alone; '' when it serves nothing.
+  const serverUrl = (tree: Tree) => {
+    const run = runs.get(tree.path)
+    const printed = isRunning(run) && run!.url ? run!.url.replace(/^(https?:\/\/)?(0\.0\.0\.0|\[::\])/, '$1localhost') : ''
+    const printedPort = Number(printed.match(/:(\d+)/)?.[1] ?? 0)
+    const port = tree.ports.find(p => p === portOf(tree)) ?? tree.ports[0]
+    const url = printed && (!port || tree.ports.includes(printedPort)) ? printed : port ? `localhost:${port}` : ''
+
+    return url && !/^https?:\/\//.test(url) ? `http://${url}` : url
+  }
+
+  // Opens the dev server of the worktree under the cursor in the browser.
+  const openServer = () => {
+    const tree = treeUnder()
+    if (!tree) return setNotice('Put the cursor on a worktree to open its dev server.')
+    const url = serverUrl(tree)
+    const port = portOf(tree)
+    if (!url) return setNotice(`${label(tree)} serves nothing: start its dev server with ! or :${port ? `, on $PORT ${port}` : ''}.`)
+    setNotice(openInBrowser(url))
+  }
+
   // Opens the file under the cursor at its line, or else its worktree (or repo-tab folder), in $EDITOR.
   const edit = () => {
     const at = row?.file ? row : row && parentOf(row)
@@ -2922,6 +2945,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'y') copyPath()
     else if (input === 'e') edit()
     else if (input === 'w') switchTree()
+    else if (input === 'B') openServer()
     else if (input === 'p' && tab === 'worktrees') remoteAct('push')
     else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
@@ -3032,7 +3056,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+      : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
