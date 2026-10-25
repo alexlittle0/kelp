@@ -1316,6 +1316,9 @@ const dollarCount = (n: number) => `$${n < 100 ? n.toFixed(2) : Math.round(n)}`
 // A count of tokens, short: "820", "45k", "1.2M".
 const tokenCount = (n: number) => (n < 1000 ? String(n) : n < 1_000_000 ? `${Math.round(n / 1000)}k` : `${(n / 1_000_000).toFixed(1)}M`)
 
+// What a session has used, short: its cost when every model it used has a price, else its tokens.
+const spendText = (spend: Spend) => (spend.dollars !== undefined ? dollarCount(spend.dollars) : `${tokenCount(spend.tokens)} tokens`)
+
 // ---- Ports ----
 
 // Whether an address in /proc/net/tcp's hex can be reached at localhost: any address, or loopback.
@@ -2320,7 +2323,7 @@ const buildRows = (
     for (const agent of busy.filter(a => a.turnAt)) details.push({ text: `${agent.name} working ${duration(Date.now() - agent.turnAt!)}` })
     // What each claude's session has cost so far, or with a model of unknown price the tokens it used.
     for (const { name, spend } of tree.agents.filter(a => a.spend)) {
-      details.push({ text: `${name} ${spend!.dollars !== undefined ? dollarCount(spend!.dollars) : `${tokenCount(spend!.tokens)} tokens`}` })
+      details.push({ text: `${name} ${spendText(spend!)}` })
     }
     // What each agent not at work last said, or asks to run, so it can be read without going there.
     for (const agent of tree.agents.filter(a => a.says && !a.isBusy)) {
@@ -2636,7 +2639,7 @@ const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) =>
     })
     if (!open) continue
 
-    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${tree.isBase ? ' · base' : ''} · pid ${agent.pid}`)
+    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${tree.isBase ? ' · base' : ''} · pid ${agent.pid}${agent.spend ? ` · ${spendText(agent.spend)}` : ''}`)
     const pane = paneOf(panes, agent.pid)
     const where = pane
       ? `tmux ${pane.id} · window ${pane.window} (${pane.windowName}) · ${pane.command}`
