@@ -20,6 +20,9 @@ const MAX_FILE_LINES = 2000
 const MAX_REPO_FILES = 20_000
 // How long a message, such as where a file was opened, stays in the footer.
 const NOTICE_MS = 4000
+// Lines of a command's output kept, and shown under its worktree.
+const RUN_KEEP = 200
+const RUN_LINES = 12
 // Lines the view moves per turn of the mouse wheel.
 const WHEEL_LINES = 3
 // How often the pull requests are fetched from GitHub, apart from the main refresh, and how many at most.
@@ -80,6 +83,12 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['u', 'merge the base branch into the worktree (twice)'],
       ['U', 'abort a merge under way (twice)'],
+    ],
+  },
+  {
+    area: 'run',
+    keys: [
+      ['!', 'run a shell command in the worktree'],
     ],
   },
   {
@@ -170,6 +179,10 @@ type Prompt = { label: string; text: string; onDone: (answer: string) => void }
 
 // A destructive action waiting for its key to be pressed again on the same row: what it will do, said in the footer.
 type Armed = { input: string; row: string; text: string; run: () => void }
+
+// A shell command run in a worktree: what and when, its last lines of output, the localhost address it mentions,
+// and once it ends its exit code (null when a signal stopped it).
+type Run = { tree: string; command: string; startedAt: number; endedAt?: number; code?: number | null; lines: string[]; url?: string; pid: number }
 
 // One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
 // `isOpenByDefault` whether it starts open, `isGap` a blank line between worktrees that the cursor passes over,
@@ -717,6 +730,85 @@ const openInBrowser = (url: string) => {
   }
 }
 
+// ---- Commands ----
+
+// The command run last in each worktree, by its folder; kept out here so it outlives refreshes.
+const runs = new Map<string, Run>()
+
+// Colours and other terminal escapes, left out of a command's output.
+const ESCAPES = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g
+
+// The local address a line of output mentions: a URL on this machine, or else "port 3000".
+const findUrl = (line: string) => {
+  const url = line.match(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(?::\d+)?[^\s'")]*/)
+  if (url) return url[0]
+  const port = line.match(/\bport:? (\d{2,5})\b/i)
+
+  return port ? `localhost:${port[1]}` : undefined
+}
+
+const isRunning = (run?: Run) => run !== undefined && run.endedAt === undefined
+
+// Runs `command` with sh in the worktree at `tree`, in a process group of its own so stopping it stops all it started.
+// `onChange` is called as output comes and when it ends. Throws when it cannot start.
+const startRun = (tree: string, command: string, onChange: () => void) => {
+  const proc = Bun.spawn(['sh', '-c', command], {
+    cwd: tree,
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    detached: true,
+    env: { ...process.env, NO_COLOR: '1' },
+  })
+  const run: Run = { tree, command, startedAt: Date.now(), lines: [], pid: proc.pid }
+  runs.set(tree, run)
+
+  const add = (lines: string[]) => {
+    for (const raw of lines) {
+      // A carriage return draws the line again, as progress bars do; keep what it ends as.
+      const line = raw.replace(ESCAPES, '').split('\r').filter(Boolean).pop()?.replace(/\t/g, '    ') ?? ''
+      run.url ??= findUrl(line)
+      run.lines.push(line)
+    }
+    run.lines.splice(0, run.lines.length - RUN_KEEP)
+    onChange()
+  }
+  const read = async (stream: ReadableStream<Uint8Array>) => {
+    const decoder = new TextDecoder()
+    // The unfinished last line.
+    let rest = ''
+    for await (const chunk of stream) {
+      const parts = (rest + decoder.decode(chunk, { stream: true })).split('\n')
+      rest = parts.pop()!
+      if (parts.length > 0) add(parts)
+    }
+    if (rest) add([rest])
+  }
+  read(proc.stdout).catch(() => {})
+  read(proc.stderr).catch(() => {})
+  // It ends when sh does, even if something it left behind still holds the output open.
+  proc.exited.then(code => {
+    run.endedAt = Date.now()
+    run.code = proc.signalCode ? null : code
+    onChange()
+  })
+
+  return run
+}
+
+// Stops a command and all it started: politely, then for good if anything is left a few seconds on.
+const stopRun = (run: Run) => {
+  const signal = (name: NodeJS.Signals) => {
+    try {
+      process.kill(-run.pid, name)
+    } catch {
+      // Already gone.
+    }
+  }
+  signal('SIGTERM')
+  setTimeout(() => signal('SIGKILL'), 3000).unref()
+}
+
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
@@ -746,6 +838,25 @@ const ago = (at: number) => {
   if (minutes < 60 * 24) return `${Math.floor(minutes / 60)}h ago`
 
   return `${Math.floor(minutes / 60 / 24)}d ago`
+}
+
+// How long something took or has run: "0.4s", "12s", "3m 05s", "1h 02m".
+const duration = (ms: number) => {
+  const s = Math.floor(ms / 1000)
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+
+  return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`
+}
+
+// How a command is doing: its mark and colour, and the words for it.
+const runState = (run: Run) => {
+  if (run.endedAt === undefined) return { mark: '▶', color: 'cyan', text: `running ${duration(Date.now() - run.startedAt)}` }
+  const took = duration(run.endedAt - run.startedAt)
+  if (run.code === 0) return { mark: '✓', color: 'green', text: `exit 0 · ${took}` }
+
+  return { mark: '✗', color: 'red', text: `${run.code === null ? 'stopped' : `exit ${run.code}`} · ${took}` }
 }
 
 const clockTime = (at: number) => {
@@ -883,6 +994,12 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     const open = isOpen(key, true)
     const name = label(tree)
     const parts: { text: string; color?: string }[] = []
+    const run = runs.get(tree.path)
+    if (run) {
+      const state = runState(run)
+      const what = run.command.length > 16 ? `${run.command.slice(0, 15)}…` : run.command
+      parts.push({ text: `${state.mark} ${what}${isRunning(run) ? ` ${duration(Date.now() - run.startedAt)}` : ''}`, color: state.color })
+    }
     // Its agents, alike ones counted together: a busy claude green, an idle one dim, the rest cyan.
     const kinds = new Map<string, { agent: Agent; count: number }>()
     for (const agent of tree.agents) {
@@ -974,6 +1091,36 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
         for (const file of tree.conflicts) fileRows(tree, { path: file, added: 0, removed: 0, tag: 'conflict' }, group)
       }
     }
+
+    // The command run here last, and the end of its output.
+    if (run) {
+      const group = `${key}\trun`
+      const isRunOpen = isOpen(group, true)
+      const state = runState(run)
+      rows.push({
+        key: group,
+        parent: key,
+        depth: 1,
+        canOpen: true,
+        isOpenByDefault: true,
+        node: (
+          <Text wrap="truncate-end">
+            <Text dimColor>{isRunOpen ? '▾' : '▸'} </Text>
+            <Text color={state.color}>{state.mark} run</Text>
+            {` ${run.command}`}
+            <Text color={state.color} dimColor={isRunning(run)}> · {state.text}</Text>
+            {run.url && <Text color="cyan"> · {run.url}</Text>}
+          </Text>
+        ),
+      })
+      if (isRunOpen) {
+        const shown = run.lines.slice(-RUN_LINES)
+        if (run.lines.length > RUN_LINES) note(`${group}\tearlier`, group, 2, `… ${run.lines.length - RUN_LINES} earlier lines`)
+        if (shown.length === 0) note(`${group}\tnone`, group, 2, isRunning(run) ? 'No output yet.' : 'No output.')
+        shown.forEach((line, n) => note(`${group}\t${n}`, group, 2, line || ' '))
+      }
+    }
+
     if (tree.uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
       if (groupLine(group, key, { text: '● uncommitted', color: 'yellow' }, '', '', tree.uncommitted.length, true)) {
@@ -1230,6 +1377,15 @@ const App = ({ root }: { root: string }) => {
     }
   }, [dir, github])
 
+  // Ticks while a command runs, so its time stays current.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if ([...runs.values()].some(r => isRunning(r))) redraw(n => n + 1)
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [])
+
   useEffect(() => {
     if (!notice) return
     const timer = setTimeout(() => setNotice(''), NOTICE_MS)
@@ -1392,6 +1548,51 @@ const App = ({ root }: { root: string }) => {
     setPrompt({ ...p, text: p.text + input.replace(/[\r\n\t]/g, '') })
   }
 
+  // The worktree the cursor is in: in the repo tab the one explored, else the one whose lines it is on.
+  const treeAtCursor = () => {
+    if (tab === 'repo') return files?.dir
+    const [kind, path] = (row?.key ?? '').split('\t')
+
+    return kind === 'tree' ? path : undefined
+  }
+  const treeName = (path: string) => {
+    const tree = repo?.trees.find(t => t.path === path)
+
+    return tree ? label(tree) : shortPath(path)
+  }
+
+  // Output can come fast; it is drawn at most ten times a second.
+  const drawTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const drawRunsSoon = () => {
+    if (drawTimer.current) return
+    drawTimer.current = setTimeout(() => {
+      drawTimer.current = undefined
+      redraw(n => n + 1)
+    }, 100)
+  }
+
+  // Runs `command` in the worktree at `tree` and shows its output under it, unless one runs there already.
+  const runIn = (tree: string, command: string) => {
+    const running = runs.get(tree)
+    if (isRunning(running)) return setNotice(`${treeName(tree)} still runs ${running!.command}; K twice stops it`)
+    try {
+      startRun(tree, command, drawRunsSoon)
+    } catch {
+      return setNotice(`Couldn't run ${command} in ${shortPath(tree)}`)
+    }
+    if (tab === 'repo') return setNotice(`Running ${command} in ${treeName(tree)}; its output is in the worktrees tab`)
+    // Open the worktree and its run section, and go to it.
+    const key = `tree\t${tree}`
+    setToggled(cur => {
+      const next = new Set(cur)
+      next.delete(key)
+      next.delete(`${key}\trun`)
+
+      return next
+    })
+    setCursor(`${key}\trun`)
+  }
+
   useInput((input, key) => {
     const mouse = input.match(/^\[<(\d+);(\d+);(\d+)([Mm])$/)
     if (mouse) {
@@ -1409,6 +1610,11 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
     else if (input === 'r') refresh.current()
+    else if (input === '!') {
+      const tree = treeAtCursor()
+      if (!tree) return setNotice('Move to a worktree to run a command in it')
+      ask(`run in ${treeName(tree)}:`, command => command && runIn(tree, command), runs.get(tree)?.command)
+    }
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
     else if (input === '2') switchTab('repo')
@@ -1460,7 +1666,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · o nvim · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · o nvim · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
@@ -1526,4 +1732,6 @@ const root = resolve(process.argv[2] ?? process.cwd())
 process.stdout.write('\x1b[?1049h\x1b[H\x1b[?1000h\x1b[?1006h')
 const app = render(<App root={root} />)
 await app.waitUntilExit()
+// Commands still running, such as dev servers, end with kelp.
+for (const run of runs.values()) if (isRunning(run)) stopRun(run)
 process.stdout.write('\x1b[?1006l\x1b[?1000l\x1b[?1049l')
