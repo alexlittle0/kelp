@@ -260,8 +260,9 @@ type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean;
 // which cost differently) and cache reads.
 type Tokens = { input: number; output: number; write5m: number; write1h: number; read: number }
 
-// What a claude's session has used: its tokens, all kinds together.
-type Spend = { tokens: number }
+// What a claude's session has used: its tokens, all kinds together, and what they cost in dollars,
+// undefined when a model it used has no known price.
+type Spend = { tokens: number; dollars?: number }
 
 // How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working;
 // `turnAt` when the person last prompted it, 0 when that is not in the part read.
@@ -1254,15 +1255,63 @@ const readUsage = (file: string) => {
   }
 }
 
+// What each model costs, in dollars per million tokens of input and output, by the start of its id. Cache writes
+// cost 1.25 times input when kept 5 minutes and twice input when kept an hour; cache reads a tenth of input,
+// unless `read` says otherwise. Only an estimate, at Anthropic's API list prices: on a subscription nobody pays per token.
+const PRICES: Record<string, { input: number; output: number; read?: number }> = {
+  'claude-fable-5-1': { input: 10, output: 50, read: 0.25 },
+  'claude-fable-5': { input: 10, output: 50 },
+  'claude-mythos-5-1': { input: 10, output: 50 },
+  'claude-opus-5-5': { input: 4, output: 20, read: 0.2 },
+  'claude-opus-5': { input: 5, output: 25 },
+  'claude-opus-4-8': { input: 5, output: 25 },
+  'claude-opus-4-7': { input: 5, output: 25 },
+  'claude-opus-4-6': { input: 5, output: 25 },
+  'claude-opus-4-5': { input: 5, output: 25 },
+  'claude-sonnet-5-5': { input: 2, output: 10, read: 0.2 },
+  'claude-sonnet-5': { input: 2, output: 10 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-sonnet-4-5': { input: 3, output: 15 },
+  'claude-haiku-5-5': { input: 0.1, output: 0.5 },
+  'claude-haiku-4-5': { input: 1, output: 5 },
+}
+
+// A model's id as PRICES knows it: without a "[1m]" for its long context or a date such as "-20251001".
+const modelName = (model: string) => model.replace(/\[1m\]$/, '').replace(/-\d{8}$/, '')
+
+// The price of a model, from the longest start of its id PRICES knows; undefined when it knows none.
+const priceOf = (model: string) => {
+  const name = modelName(model)
+  const known = Object.keys(PRICES).filter(p => name === p || name.startsWith(`${p}-`))
+
+  return known.length > 0 ? PRICES[known.reduce((a, b) => (b.length > a.length ? b : a))] : undefined
+}
+
+// What a model's tokens cost in dollars, or undefined when its price is unknown.
+const dollarsOf = (model: string, t: Tokens) => {
+  const price = priceOf(model)
+  if (!price) return undefined
+  const read = price.read ?? price.input / 10
+
+  return (t.input * price.input + t.output * price.output + t.write5m * price.input * 1.25 + t.write1h * price.input * 2 + t.read * read) / 1_000_000
+}
+
 // What the session of a claude in `cwd` has used, from its newest transcript; undefined when it has none.
 const claudeSpend = (cwd: string): Spend | undefined => {
   const transcript = newestTranscript(cwd)
   const usage = transcript && readUsage(transcript.file)
   if (!usage) return undefined
-  const all = [...usage.models.values()]
+  const used = [...usage.models].map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
+  const costs = used.map(m => dollarsOf(m.model, m.t))
 
-  return { tokens: all.reduce((n, t) => n + t.input + t.output + t.write5m + t.write1h + t.read, 0) }
+  return {
+    tokens: used.reduce((n, m) => n + m.tokens, 0),
+    dollars: costs.includes(undefined) ? undefined : costs.reduce((n: number, c) => n + c!, 0),
+  }
 }
+
+// Dollars, short: "$0.04", "$1.23", "$123".
+const dollarCount = (n: number) => `$${n < 100 ? n.toFixed(2) : Math.round(n)}`
 
 // A count of tokens, short: "820", "45k", "1.2M".
 const tokenCount = (n: number) => (n < 1000 ? String(n) : n < 1_000_000 ? `${Math.round(n / 1000)}k` : `${(n / 1_000_000).toFixed(1)}M`)
@@ -2254,8 +2303,10 @@ const buildRows = (
     if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
     // How long each busy agent has been at its current turn.
     for (const agent of busy.filter(a => a.turnAt)) details.push({ text: `${agent.name} working ${duration(Date.now() - agent.turnAt!)}` })
-    // What each claude's session has used so far.
-    for (const agent of tree.agents.filter(a => a.spend)) details.push({ text: `${agent.name} ${tokenCount(agent.spend!.tokens)} tokens` })
+    // What each claude's session has cost so far, or with a model of unknown price the tokens it used.
+    for (const { name, spend } of tree.agents.filter(a => a.spend)) {
+      details.push({ text: `${name} ${spend!.dollars !== undefined ? dollarCount(spend!.dollars) : `${tokenCount(spend!.tokens)} tokens`}` })
+    }
     // What each agent not at work last said, or asks to run, so it can be read without going there.
     for (const agent of tree.agents.filter(a => a.says && !a.isBusy)) {
       details.push({ text: agent.says!.length > 60 ? `${agent.says!.slice(0, 59)}…` : agent.says! })
