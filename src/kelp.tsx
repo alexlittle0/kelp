@@ -1422,16 +1422,17 @@ const addTree = async (repo: Repo, branch: string, path: string) => {
 }
 
 // .kelp.json at the main worktree's root: { "copy": [globs of ignored files to copy into a new worktree],
-// "postCreate": [commands run in it after] }. `error` when it is there but can't be read.
+// "postCreate": [commands run in it after], "preRemove": [commands run in a worktree before x or C removes it] }.
+// `error` when it is there but can't be read.
 const readConfig = (dir: string) => {
   const strings = (v: unknown) => (Array.isArray(v) ? v.filter(s => typeof s === 'string') : [])
-  if (!existsSync(`${dir}/.kelp.json`)) return { copy: [], postCreate: [] }
+  if (!existsSync(`${dir}/.kelp.json`)) return { copy: [], postCreate: [], preRemove: [] }
   try {
     const config = JSON.parse(readFileSync(`${dir}/.kelp.json`, 'utf8'))
 
-    return { copy: strings(config.copy), postCreate: strings(config.postCreate) }
+    return { copy: strings(config.copy), postCreate: strings(config.postCreate), preRemove: strings(config.preRemove) }
   } catch {
-    return { copy: [], postCreate: [], error: "Couldn't read .kelp.json" }
+    return { copy: [], postCreate: [], preRemove: [], error: "Couldn't read .kelp.json" }
   }
 }
 
@@ -2905,6 +2906,22 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     }
   }
 
+  // Runs .kelp.json commands one at a time in the worktree at `path` with `env`, each shown under its line as it runs.
+  // Stops at the first that fails, left shown in red, and says why; null when all ran.
+  const runHooks = async (path: string, commands: string[], env: Record<string, string>) => {
+    for (const command of commands) {
+      setJob(path, { text: `Running ${command}…` })
+      const run = await runCommand(path, ['sh', '-c', command], env)
+      if (run?.code !== 0) {
+        const why = `${command} failed (${run ? `exit ${run.code}: ${whyFailed(run.err || run.out)}` : "couldn't start"})`
+        setJob(path, { text: why, isFailed: true })
+        return why
+      }
+    }
+
+    return null
+  }
+
   // Makes a worktree for the branch named and puts the cursor on it, then readies it: copies the main worktree's
   // ignored local files it needs and runs .kelp.json's postCreate commands, saying how far it has got under its line.
   // Its folder once made, readied or not, else null.
@@ -2937,16 +2954,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       }
       done.push(`copied ${files.join(', ')}`)
     }
-    for (const command of config.postCreate) {
-      setJob(path, { text: `Running ${command}…` })
-      const run = await runCommand(path, ['sh', '-c', command], kelpEnv({ path, branch, isBase: false }, repo.base))
-      if (run?.code !== 0) {
-        const why = run ? `exit ${run.code}: ${whyFailed(run.err || run.out)}` : "couldn't start"
-        setJob(path, { text: `${command} failed (${why})`, isFailed: true })
-        return path
-      }
-      done.push(`ran ${command}`)
-    }
+    if (await runHooks(path, config.postCreate, kelpEnv({ path, branch, isBase: false }, repo.base))) return path
+    done.push(...config.postCreate.map(command => `ran ${command}`))
     setJob(path)
     setNotice(done.join(', '))
 
@@ -3149,10 +3158,15 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (!repo || !tree) return
     const plan = planRemoval(tree, repo, root, isForce)
     if (typeof plan === 'string') return setNotice(plan)
+    const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
+    const { preRemove } = readConfig(main)
+    const hooks = preRemove.length > 0 ? `, after running ${preRemove.join(', ')}${isForce ? ' even if it fails' : ''}` : ''
 
-    confirm(isForce ? 'X' : 'x', plan.ask, async () => {
+    confirm(isForce ? 'X' : 'x', `${plan.ask}${hooks}`, async () => {
       const name = label(tree)
-      const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
+      // A preRemove command that fails keeps the worktree, unless X forces it.
+      const hookFailed = await runHooks(tree.path, preRemove, kelpEnv(tree, repo.base))
+      if (hookFailed && !isForce) return setNotice(`Kept ${name}: ${hookFailed}. X removes it anyway.`)
       setNotice(`Removing ${name}…`)
       const failed = await gitDo(main, ['worktree', 'remove', ...(isForce ? ['--force'] : []), tree.path])
       if (failed) {
@@ -3187,8 +3201,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
         if (failed) failures.push(`prune: ${failed}`)
       }
       const removed: string[] = []
+      const { preRemove } = readConfig(main)
       for (const tree of merged) {
-        const failed = await gitDo(main, ['worktree', 'remove', tree.path])
+        const failed = (await runHooks(tree.path, preRemove, kelpEnv(tree, repo.base))) ?? (await gitDo(main, ['worktree', 'remove', tree.path]))
         if (failed) {
           failures.push(`${label(tree)}: ${failed}`)
           continue
