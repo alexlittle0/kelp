@@ -127,6 +127,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['c', 'commit everything in the worktree, asking for the message'],
       ['D', "discard an uncommitted file's changes (twice)"],
       ['y', 'copy the path of the file or worktree'],
+      ['e', 'open the file or worktree in $EDITOR (nvim by default)'],
+      ['w', 'switch: quit and cd the shell to the worktree (see README)'],
     ],
   },
   {
@@ -660,6 +662,27 @@ const copyText = async (text: string) => {
   if (isInTmux) return
   if (process.env.WAYLAND_DISPLAY && (await pipeTo(['wl-copy'], text))) return
   if (process.env.DISPLAY) await pipeTo(['xclip', '-selection', 'clipboard'], text)
+}
+
+// Opens a file at `line`, or a folder, in $EDITOR (nvim when unset) and says where. nvim goes the way `o` does;
+// any other editor starts in the folder, in a new tmux pane, else a new kitty window.
+const openInEditor = async (path: string, line: number) => {
+  const editor = process.env.EDITOR || 'nvim'
+  const name = basename(editor.split(/\s+/)[0])
+  if (name === 'nvim') return openInNvim(path, line)
+  let isFolder = false
+  try {
+    isFolder = statSync(path).isDirectory()
+  } catch {
+    return `Couldn't open ${shortPath(path)}: it is gone`
+  }
+  const dir = isFolder ? path : dirname(path)
+  // $EDITOR may carry its own arguments, such as "code --wait", so the shell splits it.
+  const run = ['sh', '-c', `${editor} "$1"`, 'sh', path]
+  if (process.env.TMUX && (await pipeTo(['tmux', 'split-window', '-h', '-c', dir, ...run], ''))) return `Opened ${shortPath(path)} in ${name} in a new tmux pane`
+  if (await pipeTo(['setsid', '-f', 'kitty', '--directory', dir, ...run], '')) return `Opened ${shortPath(path)} in ${name} in a new kitty window`
+
+  return `Couldn't open ${shortPath(path)} in ${name}`
 }
 
 // ---- Agents and tmux ----
@@ -2092,6 +2115,22 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setNotice(`Copied ${path} to the clipboard.`)
   }
 
+  // Quits kelp to switch to the worktree under the cursor: its path is printed, and written to --cd-file, for the shell to cd to.
+  const switchTree = () => {
+    const path = tab === 'repo' ? files?.dir : treeUnder()?.path
+    if (!path) return setNotice('Put the cursor on a worktree to switch to it.')
+    switchTo = path
+    exit()
+  }
+
+  // Opens the file under the cursor at its line, or else its worktree (or repo-tab folder), in $EDITOR.
+  const edit = () => {
+    const at = row?.file ? row : row && parentOf(row)
+    const path = at?.file ?? pathUnder()
+    if (!path) return setNotice('Nothing here to open.')
+    openInEditor(path, at?.line ?? 1).then(setNotice)
+  }
+
   // The uncommitted file the cursor is on or in the diff of: its worktree's folder, its path there, and whether git tracks it.
   const uncommittedUnder = () => {
     const at = row && (row.canOpen ? row : parentOf(row))
@@ -2246,6 +2285,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       })
     }
     else if (input === 'y') copyPath()
+    else if (input === 'e') edit()
+    else if (input === 'w') switchTree()
     else if (input === 'p' && tab === 'worktrees') remoteAct('push')
     else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
@@ -2402,10 +2443,16 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
 // ---- Main ----
 
-const root = resolve(process.argv[2] ?? process.cwd())
+// `kelp [folder] [--cd-file <path>]`: with --cd-file, `w` writes the worktree it switches to there, for a shell wrapper to cd to.
+const args = process.argv.slice(2)
+const cdAt = args.indexOf('--cd-file')
+const cdFile = cdAt === -1 ? undefined : args[cdAt + 1]
+const root = resolve(args.filter((_, k) => cdAt === -1 || (k !== cdAt && k !== cdAt + 1))[0] ?? process.cwd())
 const STATE_FILE = stateFile(root)
 // The view as it last was, saved once more on quitting.
 let latest: Saved | undefined
+// The worktree `w` switched to, told once kelp has quit.
+let switchTo = ''
 // The alternate screen, so quitting gives the terminal back as it was,
 // and mouse reports in SGR form: clicks and the wheel, not plain movement.
 process.stdout.write('\x1b[?1049h\x1b[H\x1b[?1000h\x1b[?1006h')
@@ -2415,3 +2462,7 @@ if (latest) save(STATE_FILE, latest)
 // Commands still running, such as dev servers, end with kelp.
 for (const run of runs.values()) if (isRunning(run)) stopRun(run)
 process.stdout.write('\x1b[?1006l\x1b[?1000l\x1b[?1049l')
+if (switchTo) {
+  if (cdFile) writeFileSync(cdFile, `${switchTo}\n`)
+  console.log(switchTo)
+}

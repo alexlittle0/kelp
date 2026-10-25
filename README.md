@@ -4,7 +4,7 @@ Every git worktree of a repository in one live view: what each has committed sin
 
 ```
 bun install
-bun src/kelp.tsx [folder]
+bun src/kelp.tsx [folder] [--cd-file <path>]
 ```
 
 Run it inside any worktree, or in the folder that holds them. It refreshes every few seconds.
@@ -24,6 +24,8 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **discarding**: `D` (twice) on an uncommitted file throws its changes away: a tracked file goes back to its last commit, an untracked one is deleted
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run. `t` jumps to the worktree: to its tmux pane when it has one, else to a new tmux window there named after its branch, or outside tmux a new kitty window
 - **copying**: `y` copies the path of the file or worktree under the cursor, by OSC 52 so it works through tmux and ssh, else with wl-copy or xclip
+- **editing**: `e` opens the file under the cursor at its line, or else the worktree's folder, in `$EDITOR` (nvim when unset). nvim goes the way `o` does, into the running nvim nearest the file; any other editor starts in a new tmux pane, else a new kitty window
+- **switching**: `w` quits kelp and prints the worktree under the cursor's path, and with `--cd-file <path>` writes it there too, so a shell wrapper can cd to it (see below)
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run. `t` jumps to the worktree: to its tmux pane when it has one, else to a new tmux window there named after its branch, or outside tmux a new kitty window. `a` starts claude in the worktree in a new window named "<branch> claude"
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **new worktrees**: `n` asks for a branch name and makes a worktree for it: the branch when it exists, here or on origin, else a new one from the base. It goes beside the other worktrees when they share a folder, else next to the repository as `<repo>-<branch>`. It then gets a copy of the main worktree's ignored `.env` and `.env.*` files, and runs the setup in an optional `.kelp.json` at the main worktree's root, `{ "copy": ["node_modules"], "postCreate": ["bun install"] }`: more ignored files or folders to copy, then commands to run in it, its progress shown under its line
@@ -57,9 +59,40 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `P` (twice) open a pull request with gh
 - `b` open the pull request or branch on GitHub
 - `y` copy the path of the file or worktree
+- `e` open the file or worktree in `$EDITOR`
+- `w` switch to the worktree: quit and cd there
 - `/` filter, `esc` clear it
 - `r` refresh
 - `?` list every key
 - `q` quit
+
+### Switching worktrees with `w`
+
+A program can't change its shell's folder, so `w` leaves the path for the shell. Wrap kelp in a function (this assumes the `dist/kelp` binary is on your PATH) and `w` lands you in the worktree, like `wt switch`.
+
+fish, in `~/.config/fish/functions/kelp.fish`:
+
+```fish
+function kelp
+    set -l cd_file (mktemp)
+    command kelp --cd-file $cd_file $argv
+    set -l dir (cat $cd_file)
+    rm -f $cd_file
+    test -n "$dir"; and cd $dir
+end
+```
+
+bash or zsh, in `~/.bashrc` or `~/.zshrc`:
+
+```sh
+kelp() {
+  local cd_file dir
+  cd_file=$(mktemp)
+  command kelp --cd-file "$cd_file" "$@"
+  dir=$(cat "$cd_file")
+  rm -f "$cd_file"
+  [ -n "$dir" ] && cd "$dir"
+}
+```
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.
