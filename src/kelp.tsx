@@ -127,6 +127,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['c', 'commit everything in the worktree, asking for the message'],
       ['D', "discard an uncommitted file's changes (twice)"],
       ['y', 'copy the path of the file or worktree'],
+      ['e', 'open the file or worktree in $EDITOR (nvim by default)'],
     ],
   },
   {
@@ -660,6 +661,27 @@ const copyText = async (text: string) => {
   if (isInTmux) return
   if (process.env.WAYLAND_DISPLAY && (await pipeTo(['wl-copy'], text))) return
   if (process.env.DISPLAY) await pipeTo(['xclip', '-selection', 'clipboard'], text)
+}
+
+// Opens a file at `line`, or a folder, in $EDITOR (nvim when unset) and says where. nvim goes the way `o` does;
+// any other editor starts in the folder, in a new tmux pane, else a new kitty window.
+const openInEditor = async (path: string, line: number) => {
+  const editor = process.env.EDITOR || 'nvim'
+  const name = basename(editor.split(/\s+/)[0])
+  if (name === 'nvim') return openInNvim(path, line)
+  let isFolder = false
+  try {
+    isFolder = statSync(path).isDirectory()
+  } catch {
+    return `Couldn't open ${shortPath(path)}: it is gone`
+  }
+  const dir = isFolder ? path : dirname(path)
+  // $EDITOR may carry its own arguments, such as "code --wait", so the shell splits it.
+  const run = ['sh', '-c', `${editor} "$1"`, 'sh', path]
+  if (process.env.TMUX && (await pipeTo(['tmux', 'split-window', '-h', '-c', dir, ...run], ''))) return `Opened ${shortPath(path)} in ${name} in a new tmux pane`
+  if (await pipeTo(['setsid', '-f', 'kitty', '--directory', dir, ...run], '')) return `Opened ${shortPath(path)} in ${name} in a new kitty window`
+
+  return `Couldn't open ${shortPath(path)} in ${name}`
 }
 
 // ---- Agents and tmux ----
@@ -2092,6 +2114,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setNotice(`Copied ${path} to the clipboard.`)
   }
 
+  // Opens the file under the cursor at its line, or else its worktree (or repo-tab folder), in $EDITOR.
+  const edit = () => {
+    const at = row?.file ? row : row && parentOf(row)
+    const path = at?.file ?? pathUnder()
+    if (!path) return setNotice('Nothing here to open.')
+    openInEditor(path, at?.line ?? 1).then(setNotice)
+  }
+
   // The uncommitted file the cursor is on or in the diff of: its worktree's folder, its path there, and whether git tracks it.
   const uncommittedUnder = () => {
     const at = row && (row.canOpen ? row : parentOf(row))
@@ -2246,6 +2276,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       })
     }
     else if (input === 'y') copyPath()
+    else if (input === 'e') edit()
     else if (input === 'p' && tab === 'worktrees') remoteAct('push')
     else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
