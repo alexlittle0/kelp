@@ -27,6 +27,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **copying**: `y` copies the path of the file or worktree under the cursor, by OSC 52 so it works through tmux and ssh, else with wl-copy or xclip
 - **editing**: `e` opens the file under the cursor at its line, or else the worktree's folder, in `$EDITOR` (nvim when unset). nvim goes the way `o` does, into the running nvim nearest the file; any other editor starts in a new tmux pane, else a new kitty window
 - **switching**: `w` quits kelp and prints the worktree under the cursor's path, and with `--cd-file <path>` writes it there too, so a shell wrapper can cd to it (see below)
+- **tmux**: inside tmux, the panes whose folder is in each worktree and what they run. `t` jumps to the worktree: to its tmux pane when it has one, else to a new tmux window there named after its branch, or outside tmux a new kitty window. `a` starts claude in the worktree in a new window named "<branch> claude". `N` starts a new task: it asks for a branch, then for a prompt, makes the worktree the way `n` does (`.env` copies and `.kelp.json` setup included), then starts claude in it on that prompt, in the same kind of window
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **new worktrees**: `n` asks for a branch name and makes a worktree for it: the branch when it exists, here or on origin, else a new one from the base. It goes beside the other worktrees when they share a folder, else next to the repository as `<repo>-<branch>`. It then gets a copy of the main worktree's ignored `.env` and `.env.*` files, and runs the setup in an optional `.kelp.json` at the main worktree's root, `{ "copy": ["node_modules"], "postCreate": ["bun install"] }`: more ignored files or folders to copy, then commands to run in it, its progress shown under its line
 - **missing and locked**: a worktree whose folder is gone says `missing` in red on its line, and its details say whether `C` will prune it; a locked one says so, and why, in its details. Neither can be removed with `x`
@@ -46,6 +47,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `o` open in nvim at the line under the cursor
 - `t` jump to the worktree in tmux, or open a window there
 - `a` start claude in the worktree, in a new window
+- `N` new task: a new worktree, and claude started in it on a prompt
 - `A` go to the next worktree with an agent waiting for you; press it again soon to go on to its tmux pane
 - `n` new worktree
 - `x` (twice) remove the worktree, deleting its branch when merged; `X` (twice) even with uncommitted changes or unmerged commits
