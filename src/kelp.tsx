@@ -62,6 +62,8 @@ const WAITING_MS = 60 * 60_000
 // A claude whose transcript ends on a prompt or a tool's result is waiting on its model, quietly while it thinks;
 // past this long something went wrong, and it counts as idle.
 const THINKING_MS = 10 * 60_000
+// How soon a second `A` must follow the first to go on to the worktree's tmux pane.
+const AGAIN_MS = 2000
 // How much of the end of a claude transcript is read.
 const TRANSCRIPT_TAIL = 256 * 1024
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
@@ -121,6 +123,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['t', 'jump to the worktree: its tmux pane, else a new window there'],
       ['a', 'start claude in the worktree, in a new window'],
+      ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
     ],
   },
   {
@@ -2043,6 +2046,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const tabRef = useRef(tab)
   tabRef.current = tab
   const pending = useRef(new Set<string>())
+  // Where `A` last took the cursor, and when, so a second press soon after goes on to its tmux pane.
+  const lastWaiting = useRef({ path: '', at: 0 })
   const refresh = useRef(async () => {})
   const isFetching = useRef(false)
   // The pull requests by branch, fetched from GitHub on their own slower clock so they never hold up a refresh.
@@ -2262,6 +2267,25 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (line < 2 || line - 2 >= height || !clicked || clicked.isGap) return
     setCursor(clicked.key)
     if (clicked.canOpen) toggle(clicked.key)
+  }
+
+  // Moves the cursor to the next worktree, after the one it is in, with an agent waiting for the person.
+  const nextWaiting = () => {
+    if (!repo) return
+    const here = treeUnder()
+    const last = lastWaiting.current
+    if (here && last.path === here.path && Date.now() - last.at < AGAIN_MS) {
+      lastWaiting.current = { path: '', at: 0 }
+      return jumpTo(here).then(setNotice)
+    }
+    const from = here ? repo.trees.indexOf(here) : -1
+    const next = [...repo.trees.slice(from + 1), ...repo.trees.slice(0, from + 1)].find(t => t.agents.some(a => a.isWaiting))
+    if (!next) return setNotice('No agent is waiting for you.')
+    switchTab('worktrees')
+    setCursors(cur => ({ ...cur, worktrees: `tree\t${next.path}` }))
+    lastWaiting.current = { path: next.path, at: Date.now() }
+    const agent = next.agents.find(a => a.isWaiting)!
+    setNotice(`◆ ${agent.name} in ${label(next)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''} · A again for its tmux pane`)
   }
 
   // The worktree under the cursor, or in the repo tab the one it explores.
@@ -2637,6 +2661,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'm' && tab === 'worktrees') act('land')
     else if (input === 'c' && !key.ctrl) commitAll()
     else if (input === 'D') discard()
+    else if (input === 'A') nextWaiting()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
       if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree)).then(text => {
