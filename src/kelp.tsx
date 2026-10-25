@@ -83,6 +83,12 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     ],
   },
   {
+    area: 'git',
+    keys: [
+      ['c', 'commit everything in the worktree, asking for the message'],
+    ],
+  },
+  {
     area: 'kelp',
     keys: [
       ['r', 'refresh now'],
@@ -1378,6 +1384,27 @@ const App = ({ root }: { root: string }) => {
     }
   }
 
+  // The worktree the cursor is in: the one whose line it is on or under, or in the repo tab the one explored.
+  const treeUnder = () => repo?.trees.find(t => (tab === 'repo' ? files?.dir === t.path : row?.key.split('\t')[1] === t.path))
+
+  // Asks for a message, then commits everything uncommitted in the worktree under the cursor, untracked files included.
+  const commitAll = () => {
+    const tree = treeUnder()
+    if (!tree) return
+    const name = label(tree)
+    const n = tree.uncommitted.length
+    if (n === 0) return setNotice(`${name} has nothing to commit.`)
+    ask(`commit ${n} file${n === 1 ? '' : 's'} in ${name}:`, async message => {
+      if (!message) return setNotice('Nothing committed: the message was empty.')
+      setNotice(`Committing in ${name}…`)
+      const added = await gitRun(tree.path, ['add', '-A'])
+      const run = added?.code === 0 ? await gitRun(tree.path, ['commit', '--quiet', '-m', message]) : null
+      const hash = (await git(tree.path, ['rev-parse', '--short', 'HEAD']))?.trim()
+      await refresh.current()
+      setNotice(run?.code === 0 ? `Committed ${hash} ${message} in ${name}.` : `The commit failed: run git commit in ${shortPath(tree.path)} to see why.`)
+    })
+  }
+
   // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
   const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
     const p = promptRef.current!
@@ -1408,6 +1435,7 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'q') exit()
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
+    else if (input === 'c' && !key.ctrl) commitAll()
     else if (input === 'r') refresh.current()
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
@@ -1459,8 +1487,8 @@ const App = ({ root }: { root: string }) => {
   const keys = isHelp
     ? '? esc close'
     : tab === 'repo'
-      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · o nvim · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit · tab worktrees · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · o nvim · c commit · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
