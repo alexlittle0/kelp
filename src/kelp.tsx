@@ -22,6 +22,9 @@ const MAX_REPO_FILES = 20_000
 const NOTICE_MS = 4000
 // Lines the view moves per turn of the mouse wheel.
 const WHEEL_LINES = 3
+// How often the pull requests are fetched from GitHub, apart from the main refresh, and how many at most.
+const PR_REFRESH_MS = 60_000
+const MAX_PRS = 50
 // Lines shown around each conflict.
 const CONFLICT_CONTEXT = 2
 // Who `git stash create` says made its commit, and when: fixed, so the same edits make the same commit
@@ -134,6 +137,18 @@ type Pane = { id: string; window: string; windowName: string; command: string }
 
 // `remote` is the one to push to ('' when there is none), `github` its page on GitHub ('' when it is not there).
 type Repo = { dir: string; base: string; remote: string; github: string; trees: Tree[] }
+
+// A branch's pull request on GitHub: its review decision ('' when none is needed), its checks rolled up into one
+// ('' when it has none) and the names of those failing.
+type Pr = {
+  number: number
+  title: string
+  url: string
+  state: 'draft' | 'open' | 'merged' | 'closed'
+  review: '' | 'approved' | 'changes requested' | 'review required'
+  checks: '' | 'passing' | 'failing' | 'pending'
+  failing: string[]
+}
 
 // The files of the worktree the repo tab explores, relative to its folder, and git's status code for each changed one.
 type Files = { dir: string; files: string[]; isCut: boolean; status: Record<string, string> }
@@ -618,6 +633,90 @@ const listPanes = async () => {
   }
 }
 
+// ---- GitHub ----
+
+// A command's output, error output and exit code, or null when it cannot be started, such as gh not being installed.
+// It never asks for a password or passphrase, which would hang with nobody to answer.
+const runCommand = async (cwd: string, args: string[]) => {
+  try {
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes' }
+    const proc = Bun.spawn(args, { cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+
+    return { out, err, code: await proc.exited }
+  } catch {
+    return null
+  }
+}
+
+// The line of a failed command's error output that says why: git's "error:", "fatal:" or "! [rejected]", else the last.
+const whyFailed = (err: string) => {
+  const lines = err.split('\n').map(l => l.trim()).filter(Boolean)
+
+  return lines.find(l => /^(error|fatal|!|GraphQL|HTTP)/i.test(l)) ?? lines.at(-1) ?? 'no reason given'
+}
+
+// What `gh pr list --json` gives for each pull request.
+type GhPr = {
+  number: number
+  title: string
+  url: string
+  state: string
+  isDraft: boolean
+  headRefName: string
+  reviewDecision: string
+  statusCheckRollup: { __typename: string; name?: string; context?: string; status?: string; conclusion?: string; state?: string }[] | null
+}
+const PR_FIELDS = 'number,title,url,state,isDraft,headRefName,reviewDecision,statusCheckRollup'
+const FAILED = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE']
+
+// Each branch's pull request from `gh pr list --json`'s output: the open one when it has one, else its newest.
+const parsePrs = (text: string) => {
+  const prs = new Map<string, Pr>()
+  for (const p of JSON.parse(text) as GhPr[]) {
+    const state = p.state === 'MERGED' ? 'merged' : p.state === 'CLOSED' ? 'closed' : p.isDraft ? 'draft' : 'open'
+    const had = prs.get(p.headRefName)
+    if (had && (had.state === 'open' || had.state === 'draft' || state === 'merged' || state === 'closed')) continue
+    // A check run has a status and, once completed, a conclusion; a commit status has only a state.
+    const checks = p.statusCheckRollup ?? []
+    const failing = checks.filter(c => FAILED.includes(c.conclusion || c.state || '')).map(c => c.name || c.context || '?')
+    const isPending = checks.some(c => (c.status ? c.status !== 'COMPLETED' : c.state === 'PENDING' || c.state === 'EXPECTED'))
+    const review = p.reviewDecision === 'APPROVED' ? 'approved' : p.reviewDecision === 'CHANGES_REQUESTED' ? 'changes requested' : p.reviewDecision === 'REVIEW_REQUIRED' ? 'review required' : ''
+    prs.set(p.headRefName, {
+      number: p.number,
+      title: p.title,
+      url: p.url,
+      state,
+      review,
+      checks: checks.length === 0 ? '' : failing.length > 0 ? 'failing' : isPending ? 'pending' : 'passing',
+      failing,
+    })
+  }
+
+  return prs
+}
+
+// The pull requests of the GitHub repository at `page` by branch, or null when gh is missing, logged out or fails.
+const loadPrs = async (dir: string, page: string) => {
+  const run = await runCommand(dir, ['gh', 'pr', 'list', '--repo', page.replace('https://github.com/', ''), '--state', 'all', '--limit', String(MAX_PRS), '--json', PR_FIELDS])
+  if (run?.code !== 0) return null
+  try {
+    return parsePrs(run.out)
+  } catch {
+    return null
+  }
+}
+
+// Opens a web page in the browser.
+const openInBrowser = (url: string) => {
+  try {
+    Bun.spawn([process.platform === 'darwin' ? 'open' : 'xdg-open', url], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+    return `Opened ${url}`
+  } catch {
+    return `Couldn't open ${url}`
+  }
+}
+
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
@@ -693,9 +792,18 @@ const diffRows = (parent: string, file: string, lines: string[], depth: number, 
   })
 }
 
-// Every line of the view: each worktree's line, and when open its uncommitted files and its commits,
-// each open file's diff under it. `columns` is the width rows are laid out in.
-const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, diffs: Map<string, Diff>, columns: number) => {
+// The color of a pull request's state, and of its checks.
+const PR_COLORS: Record<Pr['state'], string | undefined> = { draft: undefined, open: 'green', merged: 'magenta', closed: 'red' }
+const CHECK_PARTS: Record<Pr['checks'], { text: string; color?: string }> = {
+  '': { text: '' },
+  passing: { text: '✓ checks', color: 'green' },
+  failing: { text: '✗ checks', color: 'red' },
+  pending: { text: '● checks', color: 'yellow' },
+}
+
+// Every line of the view: each worktree's line, and when open its pull request, its uncommitted files and its commits,
+// each open file's diff under it. `columns` is the width rows are laid out in; `prs` the pull requests by branch.
+const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, diffs: Map<string, Diff>, columns: number, prs: Map<string, Pr>) => {
   const rows: Row[] = []
   const wanted: Wanted[] = []
   const others = touchedBy(repo)
@@ -805,6 +913,15 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     }
     else if (tree.upstream) parts.push({ text: 'pushed' })
     else if (repo.remote && tree.branch) parts.push({ text: 'not pushed', color: 'yellow' })
+    // Its pull request, the review and checks only while it is still open.
+    const pr = tree.isBase ? undefined : prs.get(tree.branch)
+    if (pr) {
+      parts.push({ text: `#${pr.number} ${pr.state}`, color: PR_COLORS[pr.state] })
+      if (pr.state === 'open' || pr.state === 'draft') {
+        if (pr.review) parts.push({ text: pr.review, color: pr.review === 'approved' ? 'green' : pr.review === 'changes requested' ? 'red' : undefined })
+        if (pr.checks) parts.push(CHECK_PARTS[pr.checks])
+      }
+    }
     if (!tree.isBase && tree.ahead === 0 && tree.uncommitted.length === 0) parts.push({ text: 'nothing new' })
     if (tree.lastAt > 0) parts.push({ text: ago(tree.lastAt) })
     const right = parts.map(p => p.text).join(' · ')
@@ -834,6 +951,23 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     })
     if (!open) continue
 
+    if (pr) {
+      const prKey = `${key}\tpr`
+      const details = [pr.state, pr.review, pr.checks && `checks ${pr.checks}`].filter(Boolean).join(' · ')
+      rows.push({
+        key: prKey,
+        parent: key,
+        depth: 1,
+        node: (
+          <Text wrap="truncate-end">
+            <Text color={PR_COLORS[pr.state]} dimColor={!PR_COLORS[pr.state]}>#{pr.number}</Text> {pr.title}<Text dimColor> · {details}</Text>
+          </Text>
+        ),
+      })
+      for (const name of pr.failing) {
+        rows.push({ key: `${prKey}\t${name}`, parent: prKey, depth: 2, node: <Text color="red" wrap="truncate-end">✗ {name}</Text> })
+      }
+    }
     if (tree.conflicts.length > 0) {
       const group = `${key}\tconflicts`
       if (groupLine(group, key, { text: '⚠ conflicts', color: 'red' }, `merging ${repo.base} in`, '', tree.conflicts.length, true)) {
@@ -1013,6 +1147,9 @@ const App = ({ root }: { root: string }) => {
   tabRef.current = tab
   const pending = useRef(new Set<string>())
   const refresh = useRef(async () => {})
+  // The pull requests by branch, fetched from GitHub on their own slower clock so they never hold up a refresh.
+  const [prs, setPrs] = useState(new Map<string, Pr>())
+  const fetchPrs = useRef(async () => {})
 
   useEffect(() => {
     const onResize = () => setSize({ columns: stdout.columns, rows: stdout.rows })
@@ -1063,6 +1200,36 @@ const App = ({ root }: { root: string }) => {
     return () => clearInterval(timer)
   }, [root])
 
+  // Fetches the pull requests when the repository is on GitHub; with gh missing or logged out there are just none.
+  const dir = repo?.dir ?? ''
+  const github = repo?.github ?? ''
+  useEffect(() => {
+    if (!github) return
+    let isBusy = false
+    let seen = ''
+    fetchPrs.current = async () => {
+      if (isBusy) return
+      isBusy = true
+      try {
+        const found = await loadPrs(dir, github)
+        const text = JSON.stringify(found && [...found])
+        if (found && text !== seen) {
+          seen = text
+          setPrs(found)
+        }
+      } finally {
+        isBusy = false
+      }
+    }
+    fetchPrs.current()
+    const timer = setInterval(() => fetchPrs.current(), PR_REFRESH_MS)
+
+    return () => {
+      clearInterval(timer)
+      fetchPrs.current = async () => {}
+    }
+  }, [dir, github])
+
   useEffect(() => {
     if (!notice) return
     const timer = setTimeout(() => setNotice(''), NOTICE_MS)
@@ -1082,7 +1249,7 @@ const App = ({ root }: { root: string }) => {
   const columns = Math.max(20, size.columns - 3)
   const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
   const { rows, wanted } =
-    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns) : empty
+    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns, prs) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
