@@ -105,7 +105,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['u', 'merge the base branch into the worktree (twice)'],
       ['m', 'merge the worktree\'s branch into the base branch (twice)'],
-      ['U', 'abort a merge under way (twice)'],
+      ['R', 'rebase the worktree onto the base branch (twice)'],
+      ['U', 'abort a merge or rebase under way (twice)'],
     ],
   },
   {
@@ -165,8 +166,11 @@ type Tree = {
   // or a merge is under way) and the files that would conflict.
   merged: string
   conflicts: string[]
-  // Whether a merge is under way, its conflicted files among the uncommitted ones.
+  // Whether a merge or a rebase is under way, its conflicted files among the uncommitted ones,
+  // and for a rebase how far it has got ("1/3").
   isMerging: boolean
+  isRebasing: boolean
+  rebaseStep: string
   // Its newest commit or edited file, ms since the epoch.
   lastAt: number
   // The coding agents running in it.
@@ -433,23 +437,40 @@ const readUpstreams = async (dir: string) => {
 
 type Upstreams = Awaited<ReturnType<typeof readUpstreams>>
 
+// A rebase under way: the branch it rebases (the worktree's HEAD is detached meanwhile) and how far it has got,
+// from the notes git keeps in its rebase folder.
+const readRebase = async (path: string) => {
+  for (const name of ['rebase-merge', 'rebase-apply']) {
+    const dir = (await git(path, ['rev-parse', '--git-path', name]))?.trim()
+    if (!dir || !existsSync(resolve(path, dir))) continue
+    const note = (file: string) => readText(resolve(path, dir, file))?.trim() ?? ''
+    const [step, total] = name === 'rebase-merge' ? [note('msgnum'), note('end')] : [note('next'), note('last')]
+
+    return { branch: note('head-name').replace(/^refs\/heads\//, ''), step: step && total ? `${step}/${total}` : '' }
+  }
+
+  return null
+}
+
 const loadTree = async (w: { path: string; head: string; branch: string; isMain: boolean }, base: string, upstreams: Upstreams): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
-  const [log, counts, uncommitted, headAt, mergeHead] = await Promise.all([
+  const [log, counts, uncommitted, headAt, mergeHead, rebase] = await Promise.all([
     git(w.path, ['log', ...range, '--format=%x01%h%x00%ct%x00%s', '--numstat', '--summary', '--no-renames', '--diff-merges=first-parent']),
     isBase ? Promise.resolve('0\t0') : git(w.path, ['rev-list', '--left-right', '--count', `${base}...HEAD`]),
     readUncommitted(w.path),
     git(w.path, ['log', '-1', '--format=%ct']),
     git(w.path, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD']),
+    readRebase(w.path),
   ])
   const [behind, ahead] = (counts ?? '0\t0').trim().split(/\s+/).map(Number)
   const isMerging = mergeHead !== null
-  const { merged, conflicts } = behind > 0 && !isMerging ? await readConflicts(w.path, base, uncommitted.length > 0) : { merged: '', conflicts: [] }
+  const { merged, conflicts } = behind > 0 && !isMerging && !rebase ? await readConflicts(w.path, base, uncommitted.length > 0) : { merged: '', conflicts: [] }
   const edited = uncommitted.map(c => modifiedAt(`${w.path}/${c.path}`))
 
   return {
     ...w,
+    branch: w.branch || rebase?.branch || '',
     isBase,
     ahead,
     behind,
@@ -458,6 +479,8 @@ const loadTree = async (w: { path: string; head: string; branch: string; isMain:
     merged,
     conflicts,
     isMerging,
+    isRebasing: rebase !== null,
+    rebaseStep: rebase?.step ?? '',
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
     agents: [],
     panes: [],
@@ -1225,12 +1248,21 @@ const buildRows = (
       ),
     })
     if (!open) return
-    const conflict = isConflict ? { merged: tree.isMerging ? '' : tree.merged, ours: label(tree), theirs: repo.base } : undefined
+    // A rebase replays the worktree's commits onto the base, so its HEAD side is the base.
+    const isStopped = tree.isMerging || tree.isRebasing
+    const sides = tree.isRebasing ? { ours: repo.base, theirs: label(tree) } : { ours: label(tree), theirs: repo.base }
+    const conflict = isConflict ? { merged: isStopped ? '' : tree.merged, ...sides } : undefined
     wanted.push({ key, tree: tree.path, file: change.path, commit, isUntracked: change.isUntracked, conflict })
     const diff = diffs.get(key)
     if (!diff) return note(`${key}\tloading`, key, 3, 'Loading…')
     if (diff.lines.length === 0) {
-      return note(`${key}\tempty`, key, 3, isConflict ? 'Changed on one side, deleted or renamed on the other.' : 'No textual changes.')
+      const empty = !isConflict
+        ? 'No textual changes.'
+        : isStopped
+          ? 'No conflict markers left, or changed on one side and deleted on the other: git add or git rm it once resolved.'
+          : 'Changed on one side, deleted or renamed on the other.'
+
+      return note(`${key}\tempty`, key, 3, empty)
     }
     rows.push(...diffRows(key, file, diff.lines, 3, diff.colors))
     if (diff.isCut) note(`${key}\tcut`, key, 3, `… diff cut at ${MAX_DIFF_LINES} lines`)
@@ -1273,9 +1305,10 @@ const buildRows = (
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind`, color: 'yellow' })
     const unresolved = tree.uncommitted.filter(c => c.tag === 'conflict').length
-    if (tree.isMerging) {
-      parts.push({ text: `merging ${repo.base}`, color: 'red' })
-      parts.push(unresolved > 0 ? { text: `⚠ ${unresolved} unresolved`, color: 'red' } : { text: 'resolved, ready to commit', color: 'green' })
+    if (tree.isMerging || tree.isRebasing) {
+      parts.push({ text: tree.isMerging ? `merging ${repo.base}` : `rebasing onto ${repo.base}${tree.rebaseStep ? ` ${tree.rebaseStep}` : ''}`, color: 'red' })
+      const next = tree.isMerging ? 'u commits it' : 'R carries on'
+      parts.push(unresolved > 0 ? { text: `⚠ ${unresolved} unresolved`, color: 'red' } : { text: `resolved, ${next}`, color: 'green' })
     } else if (tree.conflicts.length > 0) {
       parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'} with ${repo.base}`, color: 'red' })
     } else if (tree.merged) parts.push({ text: 'merges cleanly' })
@@ -1520,9 +1553,10 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
 
 // ---- Actions ----
 
-// What the merge keys do to a worktree: u merges the base into it, m merges its branch into the base, U aborts.
-type Action = 'merge' | 'land' | 'abort'
-const ACTION_KEYS: Record<Action, string> = { merge: 'u', land: 'm', abort: 'U' }
+// What the merge keys do to a worktree: u merges the base into it, m merges its branch into the base,
+// R rebases it onto the base, U aborts a merge or rebase under way.
+type Action = 'merge' | 'land' | 'rebase' | 'abort'
+const ACTION_KEYS: Record<Action, string> = { merge: 'u', land: 'm', rebase: 'R', abort: 'U' }
 
 // An action's git, where it runs, what the first press asks, and what to say after by git's exit code
 // (0, or 1 for stopping on conflicts); any other code says it failed.
@@ -1530,19 +1564,39 @@ type Step = { ask: string; cwd: string; args: string[]; said: Record<number, str
 
 // What an action would do to `tree`, or why it can't. m merges into the base in the base's own worktree,
 // as git can't move a branch another worktree has checked out, so that worktree must be clean too.
+// A merge or rebase stopped on conflicts goes on with u or R once they are all resolved and added.
 const planFor = (action: Action, tree: Tree, repo: Repo): Step | string => {
   const name = label(tree)
   const base = repo.base
   const baseTree = repo.trees.find(t => t.isBase)
   const n = tree.conflicts.length
   const conflicts = `${n} conflict${n === 1 ? '' : 's'}`
+  const unresolved = tree.uncommitted.filter(c => c.tag === 'conflict').length
+  const resolveFirst = `${name} has ${unresolved} unresolved file${unresolved === 1 ? '' : 's'}: resolve, git add, then`
   if (action === 'abort') {
-    if (!tree.isMerging) return `${name} is not merging anything.`
+    const what = tree.isMerging ? 'merge' : 'rebase'
+    if (!tree.isMerging && !tree.isRebasing) return `${name} is not merging or rebasing anything.`
 
-    return { ask: `abort ${name}'s merge and put it back as it was`, cwd: tree.path, args: ['merge', '--abort'], said: { 0: `Aborted ${name}'s merge.` } }
+    return { ask: `abort ${name}'s ${what} and put it back as it was`, cwd: tree.path, args: [what, '--abort'], said: { 0: `Aborted ${name}'s ${what}.` } }
   }
-  if (tree.isBase) return action === 'merge' ? `${name} is the base branch.` : `${name} is the base branch: m merges another worktree's branch into it.`
-  if (tree.isMerging) return `${name} is merging ${base}: resolve and commit, or U to abort.`
+  if (tree.isMerging) {
+    if (action !== 'merge') return `${name} is merging ${base}: resolve and u commits it, or U aborts.`
+    if (unresolved > 0) return `${resolveFirst} u commits the merge.`
+
+    return { ask: `commit the merge of ${base} into ${name}`, cwd: tree.path, args: ['commit', '--no-edit'], said: { 0: `Merged ${base} into ${name}.` } }
+  }
+  if (tree.isRebasing) {
+    if (action !== 'rebase') return `${name} is rebasing onto ${base}: resolve and R carries on, or U aborts.`
+    if (unresolved > 0) return `${resolveFirst} R carries the rebase on.`
+
+    return {
+      ask: `carry on rebasing ${name} onto ${base}`,
+      cwd: tree.path,
+      args: ['rebase', '--continue'],
+      said: { 0: `Rebased ${name} onto ${base}.`, 1: `Rebasing ${name} stopped on conflicts again: resolve, git add, then R; U aborts.` },
+    }
+  }
+  if (tree.isBase) return action === 'land' ? `${name} is the base branch: m merges another worktree's branch into it.` : `${name} is the base branch.`
   if (tree.uncommitted.length > 0) return `${name} has uncommitted changes: commit them first.`
 
   if (action === 'merge') {
@@ -1556,11 +1610,22 @@ const planFor = (action: Action, tree: Tree, repo: Repo): Step | string => {
     }
   }
 
+  if (action === 'rebase') {
+    if (tree.behind === 0) return `${name} already has everything in ${base}.`
+
+    return {
+      ask: `rebase ${name} onto ${base}${n > 0 ? ', which will stop on conflicts to resolve' : ''}`,
+      cwd: tree.path,
+      args: ['rebase', base],
+      said: { 0: `Rebased ${name} onto ${base}.`, 1: `Rebasing ${name} stopped on conflicts: resolve, git add, then R carries on; U aborts.` },
+    }
+  }
+
   if (!tree.branch) return `${name} is not on a branch.`
   if (tree.ahead === 0) return `${name} has nothing ${base} doesn't.`
   if (n > 0) return `${name} would conflict with ${base} (${conflicts}): u merges ${base} in to resolve them first.`
   if (!baseTree) return `${base} is not checked out in any worktree to merge into.`
-  if (baseTree.uncommitted.length > 0 || baseTree.isMerging) return `${base}'s worktree has uncommitted changes: commit them first.`
+  if (baseTree.uncommitted.length > 0 || baseTree.isMerging || baseTree.isRebasing) return `${base}'s worktree has uncommitted changes: commit them first.`
 
   return {
     ask: `merge ${name} into ${base}${tree.behind === 0 ? ', a fast-forward' : ' with a merge commit'}`,
@@ -2115,6 +2180,7 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'p' && tab === 'worktrees') remoteAct('push')
     else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
+    else if (input === 'R' && tab === 'worktrees') act('rebase')
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()
@@ -2199,12 +2265,15 @@ const App = ({ root }: { root: string }) => {
   )
   // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
   const discardKey = uncommittedUnder() ? ' · D discard' : ''
+  // The merge keys for the worktree under the cursor: carrying on or aborting what is under way, else merging the base in.
+  const cursorTree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
+  const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
   const keys = isHelp
     ? '? esc close'
     : tab === 'repo'
       ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · u merge ${repo?.base ?? 'base'} in${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
