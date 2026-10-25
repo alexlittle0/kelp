@@ -1,2 +1,4 @@
+node_modules/
+dist/
 .claude/worktrees/
 .claude/KELP_AGENT_RULES.md
