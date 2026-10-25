@@ -129,7 +129,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['a', 'start claude in the worktree, in a new window'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's claude, in its tmux pane"],
+      ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it"],
     ],
   },
   {
@@ -2432,6 +2432,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
   // `>`: asks for a message and types it into the tmux pane of the worktree's claude, the one waiting for the person
   // first, else an idle one, else one at work, which takes it once its turn is done. Says why when there is no pane to send to.
+  // On a line of a diff or file it asks for a review note instead, sent as "<file>:<line>: <note>".
   const reply = () => {
     const tree = treeUnder()
     if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
@@ -2443,9 +2444,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
     if (!pane) return setNotice(`claude in ${name} runs in no tmux pane kelp can see, so there is nowhere to send to.`)
     const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
-    ask(`reply to claude in ${name} (${state}):`, async text => {
+    // A line under a file, not the file's own line, which opens and closes.
+    const at = row?.file && !row.canOpen && row.file.startsWith(`${tree.path}/`) ? `${row.file.slice(tree.path.length + 1)}:${row.line ?? 1}` : ''
+    ask(at ? `note on ${at} for claude in ${name} (${state}):` : `reply to claude in ${name} (${state}):`, async text => {
       if (!text) return
-      const isSent = await typeInto(pane, text)
+      const isSent = await typeInto(pane, at ? `${at}: ${text}` : text)
       setNotice(isSent ? `Sent to claude in ${name}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
       refresh.current()
     })
