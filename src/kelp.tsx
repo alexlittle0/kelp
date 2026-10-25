@@ -56,6 +56,13 @@ type Diff = { lines: string[]; isCut: boolean; isUnreadable?: boolean; version: 
 
 type Tab = 'worktrees' | 'repo'
 
+// A one-line question asked in the footer, such as a new branch's name: what it asks, what is typed so far,
+// and what is done with the answer once ⏎ is pressed.
+type Prompt = { label: string; text: string; onDone: (answer: string) => void }
+
+// A destructive action waiting for its key to be pressed again on the same row: what it will do, said in the footer.
+type Armed = { input: string; row: string; text: string; run: () => void }
+
 // One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
 // `isOpenByDefault` whether it starts open, `isGap` a blank line between worktrees that the cursor passes over,
 // `file` and `line` where `o` opens it in nvim.
@@ -667,6 +674,14 @@ const App = ({ root }: { root: string }) => {
   // Whether the repo tab shows an open file or its diff against HEAD.
   const [isDiff, setIsDiff] = useState(false)
   const [notice, setNotice] = useState('')
+  // The footer's question, kept in a ref too so keys typed faster than a redraw all land.
+  const [prompt, setPromptState] = useState<Prompt | null>(null)
+  const promptRef = useRef<Prompt | null>(null)
+  const setPrompt = (next: Prompt | null) => {
+    promptRef.current = next
+    setPromptState(next)
+  }
+  const [armed, setArmed] = useState<Armed | null>(null)
   // Each tab keeps its own cursor and scroll.
   const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
@@ -733,6 +748,13 @@ const App = ({ root }: { root: string }) => {
 
     return () => clearTimeout(timer)
   }, [notice])
+
+  useEffect(() => {
+    if (!armed) return
+    const timer = setTimeout(() => setArmed(null), NOTICE_MS)
+
+    return () => clearTimeout(timer)
+  }, [armed])
 
   const isOpen = (key: string, byDefault: boolean) => byDefault !== toggled.has(key)
   // Gutter of two, and one column spare so a row never touches the edge and wraps.
@@ -826,12 +848,44 @@ const App = ({ root }: { root: string }) => {
     if (clicked.canOpen) toggle(clicked.key)
   }
 
+  // Asks `label` in the footer, then calls `onDone` with the answer, unless esc is pressed.
+  const ask = (label: string, onDone: (answer: string) => void, text = '') => setPrompt({ label, text, onDone })
+
+  // Runs `run` when `input` is pressed a second time on the same row; the first press says `text` in the footer.
+  const confirm = (input: string, text: string, run: () => void) => {
+    const at = row?.key ?? ''
+    if (armed && armed.input === input && armed.row === at) {
+      setArmed(null)
+      run()
+    } else {
+      setArmed({ input, row: at, text, run })
+    }
+  }
+
+  // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
+  const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
+    const p = promptRef.current!
+    if (key.escape) return setPrompt(null)
+    if (key.return) {
+      setPrompt(null)
+      return p.onDone(p.text.trim())
+    }
+    if (key.backspace || key.delete) return setPrompt({ ...p, text: p.text.slice(0, -1) })
+    if (key.ctrl && input === 'u') return setPrompt({ ...p, text: '' })
+    if (key.ctrl || key.meta) return
+    setPrompt({ ...p, text: p.text + input.replace(/[\r\n\t]/g, '') })
+  }
+
   useInput((input, key) => {
     const mouse = input.match(/^\[<(\d+);(\d+);(\d+)([Mm])$/)
     if (mouse) {
       if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[2]), Number(mouse[3]))
+      return
     }
-    else if (input === 'q') exit()
+    if (promptRef.current) return typeInPrompt(input, key)
+    // Any other key lets an armed action go.
+    if (armed && input !== armed.input) setArmed(null)
+    if (input === 'q') exit()
     else if (input === 'r') refresh.current()
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
@@ -899,10 +953,22 @@ const App = ({ root }: { root: string }) => {
           )
         })}
       </Box>
-      <Text dimColor wrap="truncate-end">
-        {notice ? <Text color="yellow">{notice}</Text> : keys}
-        {!notice && updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
-      </Text>
+      {prompt ? (
+        <Text wrap="truncate-start">
+          <Text color="blue" bold>{prompt.label}</Text> {prompt.text}<Text inverse> </Text>
+          <Text dimColor> · ⏎ ok · esc cancel</Text>
+        </Text>
+      ) : armed ? (
+        <Text wrap="truncate-end">
+          <Text color="red">{armed.text}</Text>
+          <Text dimColor> · press {armed.input} again to go ahead, any other key to keep it</Text>
+        </Text>
+      ) : (
+        <Text dimColor wrap="truncate-end">
+          {notice ? <Text color="yellow">{notice}</Text> : keys}
+          {!notice && updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
+        </Text>
+      )}
     </Box>
   )
 }
