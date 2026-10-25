@@ -118,6 +118,12 @@ type Tree = {
   agents: Agent[]
   // The tmux panes whose folder is in it.
   panes: Pane[]
+  // The remote branch it tracks, such as "origin/feature", or '' when it tracks none,
+  // how far it is ahead of and behind that, and whether that branch is gone from the remote.
+  upstream: string
+  unpushed: number
+  unpulled: number
+  isUpstreamGone: boolean
 }
 
 // A coding agent running in a worktree; `isBusy` is known only for claude, from its transcript.
@@ -126,7 +132,8 @@ type Agent = { name: string; pid: number; isBusy?: boolean }
 // A tmux pane: its id, its window as "session:index", that window's name, and what it runs.
 type Pane = { id: string; window: string; windowName: string; command: string }
 
-type Repo = { dir: string; base: string; trees: Tree[] }
+// `remote` is the one to push to ('' when there is none), `github` its page on GitHub ('' when it is not there).
+type Repo = { dir: string; base: string; remote: string; github: string; trees: Tree[] }
 
 // The files of the worktree the repo tab explores, relative to its folder, and git's status code for each changed one.
 type Files = { dir: string; files: string[]; isCut: boolean; status: Record<string, string> }
@@ -320,7 +327,38 @@ const readConflicts = async (path: string, base: string, hasUncommitted: boolean
   return { merged, conflicts: [...new Set(files.filter(Boolean))] }
 }
 
-const loadTree = async (w: { path: string; head: string; branch: string }, base: string): Promise<Tree> => {
+// The remote to push to: origin, else the first there is, else ''.
+const findRemote = async (dir: string) => {
+  const names = ((await git(dir, ['remote'])) ?? '').split('\n').filter(Boolean)
+
+  return names.includes('origin') ? 'origin' : (names[0] ?? '')
+}
+
+// A remote's page on GitHub, such as "https://github.com/owner/repo", or '' when it is elsewhere.
+const githubPage = (url: string) => {
+  const found = url.trim().match(/github\.com[:/]+([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/)
+
+  return found ? `https://github.com/${found[1]}` : ''
+}
+
+// Each local branch's upstream, and how far the branch is ahead of and behind it.
+const readUpstreams = async (dir: string) => {
+  const text = (await git(dir, ['for-each-ref', '--format=%(refname:lstrip=2)%00%(upstream:short)%00%(upstream:track,nobracket)', 'refs/heads'])) ?? ''
+  const upstreams = new Map<string, { upstream: string; unpushed: number; unpulled: number; isUpstreamGone: boolean }>()
+  for (const line of text.split('\n')) {
+    const [branch, upstream, track] = line.split('\0')
+    if (!branch || !upstream) continue
+    const unpushed = Number(track.match(/ahead (\d+)/)?.[1] ?? 0)
+    const unpulled = Number(track.match(/behind (\d+)/)?.[1] ?? 0)
+    upstreams.set(branch, { upstream, unpushed, unpulled, isUpstreamGone: track === 'gone' })
+  }
+
+  return upstreams
+}
+
+type Upstreams = Awaited<ReturnType<typeof readUpstreams>>
+
+const loadTree = async (w: { path: string; head: string; branch: string }, base: string, upstreams: Upstreams): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
   const [log, counts, uncommitted, headAt, mergeHead] = await Promise.all([
@@ -348,6 +386,7 @@ const loadTree = async (w: { path: string; head: string; branch: string }, base:
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
     agents: [],
     panes: [],
+    ...(upstreams.get(w.branch) ?? { upstream: '', unpushed: 0, unpulled: 0, isUpstreamGone: false }),
   }
 }
 
@@ -356,8 +395,9 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const dir = await findRepo(root)
   if (!dir) return null
   const worktrees = await listWorktrees(dir)
-  const base = await findBase(dir, worktrees[0]?.branch ?? '')
-  const [trees, panes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base))), listPanes()])
+  const [base, remote, upstreams] = await Promise.all([findBase(dir, worktrees[0]?.branch ?? ''), findRemote(dir), readUpstreams(dir)])
+  const url = remote ? ((await git(dir, ['remote', 'get-url', remote])) ?? '') : ''
+  const [trees, panes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base, upstreams))), listPanes()])
   trees.sort((a, b) => Number(b.isBase) - Number(a.isBase) || label(a).localeCompare(label(b)))
   for (const agent of findAgents()) {
     const { cwd, ...rest } = agent
@@ -365,7 +405,7 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   }
   for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
 
-  return { dir, base, trees }
+  return { dir, base, remote, github: githubPage(url), trees }
 }
 
 // A conflicted file's conflicts, each with a few lines around it, runs apart split by "…". The worktree's side
@@ -758,6 +798,13 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'} with ${repo.base}`, color: 'red' })
     } else if (tree.merged) parts.push({ text: 'merges cleanly' })
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length} uncommitted`, color: 'yellow' })
+    // Where it stands against its remote branch; nothing when the repository has no remote.
+    if (tree.isUpstreamGone) parts.push({ text: 'upstream gone', color: 'red' })
+    else if (tree.unpushed > 0 || tree.unpulled > 0) {
+      parts.push({ text: [tree.unpushed > 0 && `↑${tree.unpushed}`, tree.unpulled > 0 && `↓${tree.unpulled}`].filter(Boolean).join(' '), color: 'cyan' })
+    }
+    else if (tree.upstream) parts.push({ text: 'pushed' })
+    else if (repo.remote && tree.branch) parts.push({ text: 'not pushed', color: 'yellow' })
     if (!tree.isBase && tree.ahead === 0 && tree.uncommitted.length === 0) parts.push({ text: 'nothing new' })
     if (tree.lastAt > 0) parts.push({ text: ago(tree.lastAt) })
     const right = parts.map(p => p.text).join(' · ')
