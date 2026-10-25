@@ -156,6 +156,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['c', 'commit what is staged, or with nothing staged everything, asking for the message'],
       ['+ -', 'stage, unstage the uncommitted file (on "uncommitted": all of them)'],
+      ['z', 'stash the uncommitted changes, untracked included, asking for a message'],
+      ['Z', 'pop the stash under the cursor, or the worktree\'s latest (twice)'],
       ['D', "discard an uncommitted file's changes (twice)"],
       ['y', 'copy the path of the file or worktree'],
       ['e', 'open the file or worktree in $EDITOR (nvim by default)'],
@@ -189,6 +191,10 @@ type Change = { path: string; added: number; removed: number; tag: '' | 'new' | 
 
 type Commit = { hash: string; at: number; subject: string; files: Change[] }
 
+// A stash made on a worktree's branch: its place in the stash list ("stash@{0}"), its commit, when, its message,
+// and the files it holds, untracked ones (kept in its third parent) marked so.
+type Stash = { ref: string; hash: string; at: number; message: string; files: Change[] }
+
 // A worktree: where it is, what it has checked out, how far it is from the base branch, and what it holds.
 type Tree = {
   path: string
@@ -208,6 +214,8 @@ type Tree = {
   isMerged: boolean
   commits: Commit[]
   uncommitted: Change[]
+  // The stashes made on its branch, newest first.
+  stashes: Stash[]
   // Merging the base in, worked out in memory: the merged tree ('' when not worked out, as nothing is behind
   // or a merge is under way) and the files that would conflict.
   merged: string
@@ -576,11 +584,46 @@ const loadTree = async (
     rebaseStep: rebase?.step ?? '',
     diffStat: parseShortstat(shortstat ?? ''),
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
+    stashes: [],
     agents: [],
     panes: [],
     ports: [],
     ...(upstreams.get(w.branch) ?? { upstream: '', unpushed: 0, unpulled: 0, isUpstreamGone: false }),
   }
+}
+
+// The repository's stashes, which every worktree shares, made on one of `branches`, by branch, newest first.
+// Git names the branch in the stash's subject: "On <branch>: <message>", or "WIP on <branch>: <hash> <subject>".
+const readStashes = async (dir: string, branches: string[]) => {
+  const text = (await git(dir, ['stash', 'list', '--format=%gd%x00%H%x00%ct%x00%gs'])) ?? ''
+  const listed = text
+    .split('\n')
+    .map(line => {
+      const [ref, hash, time, subject] = line.split('\0')
+      const found = subject?.match(/^(?:WIP on|On) ([^:]+): (.*)$/)
+
+      return { ref, hash, at: Number(time) * 1000, branch: found?.[1] ?? '', message: found?.[2] ?? '' }
+    })
+    .filter(s => s.branch && branches.includes(s.branch))
+  const stashes = new Map<string, Stash[]>()
+  const read = listed.map(async ({ branch, ...stash }) => {
+    const hash = stash.hash
+    // Its tracked changes against the commit it was made on, and its untracked files, when it has any.
+    const format = '--format=%x01%h%x00%ct%x00%s'
+    const [tracked, untracked] = await Promise.all([
+      git(dir, ['log', '-1', format, '--numstat', '--summary', '--no-renames', '--diff-merges=first-parent', hash]),
+      git(dir, ['log', '-1', format, '--numstat', '--summary', '--no-renames', `${hash}^3`]),
+    ])
+    const files = [
+      ...(parseLog(tracked ?? '')[0]?.files ?? []),
+      ...(parseLog(untracked ?? '')[0]?.files ?? []).map(f => ({ ...f, isUntracked: true })),
+    ]
+
+    return { branch, stash: { ...stash, files } }
+  })
+  for (const { branch, stash } of await Promise.all(read)) stashes.set(branch, [...(stashes.get(branch) ?? []), stash])
+
+  return stashes
 }
 
 // Every worktree of the repository at or under `root`, the base branch's first and the rest by branch name.
@@ -590,8 +633,9 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const worktrees = await listWorktrees(dir)
   const [base, remote, upstreams] = await Promise.all([findBase(dir, worktrees[0]?.branch ?? ''), findRemote(dir), readUpstreams(dir)])
   const url = remote ? ((await git(dir, ['remote', 'get-url', remote])) ?? '') : ''
-  const [trees, panes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base, upstreams))), listPanes()])
+  const [trees, panes, stashes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base, upstreams))), listPanes(), readStashes(dir, worktrees.map(w => w.branch))])
   trees.sort((a, b) => Number(b.isBase) - Number(a.isBase) || label(a).localeCompare(label(b)))
+  for (const tree of trees) tree.stashes = (tree.branch && stashes.get(tree.branch)) || []
   for (const agent of findAgents()) {
     const { cwd, ...rest } = agent
     treeAt(trees, cwd)?.agents.push(rest)
@@ -1683,7 +1727,8 @@ const buildRows = (
     const conflicts = tree.conflicts.filter(shows)
     const uncommitted = tree.uncommitted.filter(c => shows(c.path))
     const commits = tree.commits.map(c => ({ ...c, files: c.files.filter(f => shows(f.path)) })).filter(c => isWhole || c.files.length > 0)
-    if (!isWhole && conflicts.length + uncommitted.length + commits.length === 0) continue
+    const stashes = tree.stashes.map(s => ({ ...s, files: s.files.filter(f => shows(f.path)) })).filter(s => isWhole || s.files.length > 0)
+    if (!isWhole && conflicts.length + uncommitted.length + commits.length + stashes.length === 0) continue
     // Worktrees start closed, one line each; a blank line sets one apart only after one left open.
     if (rows.length > 0 && rows[rows.length - 1].depth > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
     const open = isOpen(key, false)
@@ -1761,6 +1806,7 @@ const buildRows = (
       else if (tree.upstream) details.push({ text: 'pushed' })
       else if (repo.remote && tree.branch) details.push({ text: 'not pushed' })
     }
+    if (tree.stashes.length > 0) details.push({ text: `${tree.stashes.length} stash${tree.stashes.length === 1 ? '' : 'es'}` })
     if (tree.panes.length > 0) details.push({ text: `tmux ${[...new Set(tree.panes.map(p => p.command))].join(', ')}` })
     if (tree.lastAt > 0) parts.push({ text: ago(tree.lastAt) })
     const right = parts.map(p => p.text).join(' · ')
@@ -1867,6 +1913,14 @@ const buildRows = (
         for (const change of uncommitted) fileRows(tree, change, group)
       }
     }
+    // Its stashes, closed, each opening to its files and their diffs.
+    for (const stash of stashes) {
+      const group = `${key}\tstash\t${stash.hash}`
+      if (groupLine(group, key, { text: stash.ref, color: 'cyan' }, stash.message, ` · ${ago(stash.at)}`, stash.files.length, false)) {
+        for (const change of stash.files) fileRows(tree, change, group, change.isUntracked ? `${stash.hash}^3` : stash.hash)
+        if (stash.files.length === 0) note(`${group}\tnone`, group, 2, 'No file changes.')
+      }
+    }
     for (const commit of commits) {
       const group = `${key}\t${commit.hash}`
       if (groupLine(group, key, { text: commit.hash, color: 'yellow' }, commit.subject, ` · ${ago(commit.at)}`, commit.files.length, !isWhole)) {
@@ -1874,7 +1928,7 @@ const buildRows = (
         if (commit.files.length === 0) note(`${group}\tnone`, group, 2, 'No file changes.')
       }
     }
-    if (tree.commits.length === 0 && tree.uncommitted.length === 0) {
+    if (tree.commits.length === 0 && tree.uncommitted.length === 0 && tree.stashes.length === 0) {
       note(`${key}\tnone`, key, 1, `Nothing ahead of ${repo.base} and no uncommitted changes.`)
     }
   }
@@ -2789,6 +2843,50 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setNotice(`${isStage ? 'Staged' : 'Unstaged'} ${what}.`)
   }
 
+  // Asks for a message, then stashes everything uncommitted in the worktree under the cursor, untracked files included.
+  const stashAll = () => {
+    const tree = treeUnder()
+    if (!tree) return
+    const name = label(tree)
+    const n = tree.uncommitted.length
+    if (n === 0) return setNotice(`${name} has nothing to stash.`)
+    ask(`stash ${plural(n, 'file')} in ${name}, message:`, async message => {
+      setNotice(`Stashing in ${name}…`)
+      const run = await runCommand(tree.path, ['git', 'stash', 'push', '--include-untracked', ...(message ? ['-m', message] : [])])
+      await refresh.current()
+      setNotice(run?.code === 0 ? `Stashed ${plural(n, 'file')} in ${name}${message ? `: ${message}` : ''}.` : `Couldn't stash: ${run ? whyFailed(run.err) : 'git did not start'}`)
+    })
+  }
+
+  // The stash the cursor is on or in, by its commit.
+  const stashUnder = (tree: Tree) => {
+    const parts = row?.key.split('\t') ?? []
+
+    return parts[2] === 'stash' ? tree.stashes.find(s => s.hash === parts[3]) : undefined
+  }
+
+  // Pops the stash under the cursor, or else the worktree's latest, into the worktree on a second press of Z.
+  const popStash = () => {
+    const tree = treeUnder()
+    if (!tree) return
+    const name = label(tree)
+    const stash = stashUnder(tree) ?? tree.stashes[0]
+    if (!stash) return setNotice(`${name} has no stashes: z stashes its uncommitted changes.`)
+
+    confirm('Z', `Pop ${stash.ref} (${stash.message}) into ${name}, dropping it from the stash list`, async () => {
+      // Found again by its commit, as other stashes may have come or gone since.
+      const list = (await git(tree.path, ['stash', 'list', '--format=%gd%x00%H'])) ?? ''
+      const ref = list.split('\n').map(l => l.split('\0')).find(([, hash]) => hash === stash.hash)?.[0]
+      if (!ref) return setNotice(`${stash.ref} is gone from the stash list.`)
+      setNotice(`Popping ${ref} into ${name}…`)
+      const run = await runCommand(tree.path, ['git', 'stash', 'pop', '--quiet', ref])
+      await refresh.current()
+      if (run?.code === 0) return setNotice(`Popped ${ref} into ${name}.`)
+      // A pop that conflicts leaves the conflicts in the files and keeps the stash.
+      setNotice(`Couldn't pop ${ref} cleanly: ${run ? whyFailed(run.err || run.out) : 'git did not start'}`)
+    })
+  }
+
   // Removes the worktree under the cursor on a second press of x, or of X to force it past uncommitted changes
   // and unmerged commits, deleting its branch when that is fully in the base and keeping it otherwise.
   const removeTree = (isForce: boolean) => {
@@ -2944,6 +3042,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'c' && !key.ctrl) commitAll()
     else if (input === 'D') discard()
     else if (input === '+' || input === '-') stage(input === '+')
+    else if (input === 'z' && tab === 'worktrees') stashAll()
+    else if (input === 'Z' && tab === 'worktrees') popStash()
     else if (input === 'A') nextWaiting()
     else if (input === '>') reply()
     else if (input === 't' || input === 'a') {
@@ -3056,7 +3156,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   )
   // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
   const isUncommittedLine = tab === 'worktrees' && row?.key.endsWith('\tuncommitted') === true
-  const discardKey = uncommittedUnder() ? ' · +/- stage · D discard' : isUncommittedLine ? ' · +/- stage all' : ''
+  const isStashLine = tab === 'worktrees' && row?.key.split('\t')[2] === 'stash'
+  const discardKey = uncommittedUnder() ? ' · +/- stage · D discard' : isUncommittedLine ? ' · +/- stage all · z stash' : isStashLine ? ' · Z pop' : ''
   // The merge keys for the worktree under the cursor: carrying on or aborting what is under way, else merging the base in.
   const cursorTree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
