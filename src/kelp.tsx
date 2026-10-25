@@ -102,6 +102,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'run',
     keys: [
       ['!', 'run a shell command in the worktree'],
+      [':', 'run one of its commands: .kelp.json or package.json'],
     ],
   },
   {
@@ -784,6 +785,43 @@ const openInBrowser = (url: string) => {
 }
 
 // ---- Commands ----
+
+// What .kelp.json in `dir` holds, such as { "commands": { "test": "bun test" } }; {} when there is none or it isn't JSON.
+// Keys kelp doesn't know are left alone.
+const readKelpJson = (dir: string): Record<string, unknown> => {
+  try {
+    const json = JSON.parse(readFileSync(`${dir}/.kelp.json`, 'utf8'))
+
+    return json && typeof json === 'object' ? json : {}
+  } catch {
+    return {}
+  }
+}
+
+// The named commands `:` offers in the worktree at `tree`: "commands" in its .kelp.json, or failing that the main
+// checkout's at `repoDir`; with neither, its package.json's scripts, run with the package manager its lock file names.
+const loadCommands = (tree: string, repoDir: string) => {
+  for (const dir of [tree, repoDir]) {
+    const commands = readKelpJson(dir).commands
+    if (commands && typeof commands === 'object') {
+      return Object.entries(commands as Record<string, unknown>)
+        .filter(([, command]) => typeof command === 'string')
+        .map(([name, command]) => ({ name, command: command as string }))
+    }
+  }
+  try {
+    const scripts = JSON.parse(readFileSync(`${tree}/package.json`, 'utf8')).scripts ?? {}
+    const manager =
+      existsSync(`${tree}/bun.lock`) || existsSync(`${tree}/bun.lockb`) ? 'bun'
+      : existsSync(`${tree}/pnpm-lock.yaml`) ? 'pnpm'
+      : existsSync(`${tree}/yarn.lock`) ? 'yarn'
+      : 'npm'
+
+    return Object.keys(scripts).map(name => ({ name, command: `${manager} run ${name}` }))
+  } catch {
+    return []
+  }
+}
 
 // The command run last in each worktree, by its folder; kept out here so it outlives refreshes.
 const runs = new Map<string, Run>()
@@ -1826,6 +1864,20 @@ const App = ({ root }: { root: string }) => {
       if (!tree) return setNotice('Move to a worktree to run a command in it')
       ask(`run in ${treeName(tree)}:`, command => command && runIn(tree, command), runs.get(tree)?.command)
     }
+    else if (input === ':') {
+      // Names one of the worktree's commands; the start of a name, or any part of it, will do.
+      const tree = treeAtCursor()
+      if (!tree) return setNotice('Move to a worktree to run a command in it')
+      const commands = loadCommands(tree, repo?.dir ?? tree)
+      if (commands.length === 0) return setNotice(`No commands: add { "commands": { "test": "bun test" } } to .kelp.json, or scripts to package.json`)
+      const last = commands.find(c => c.command === runs.get(tree)?.command)?.name
+      ask(`run in ${treeName(tree)} (${commands.map(c => c.name).join(' · ')}):`, name => {
+        if (!name) return
+        const found = commands.find(c => c.name === name) ?? commands.find(c => c.name.startsWith(name)) ?? commands.find(c => c.name.includes(name))
+        if (!found) return setNotice(`No command named ${name}`)
+        runIn(tree, found.command)
+      }, last)
+    }
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
     else if (input === '2') switchTab('repo')
@@ -1879,7 +1931,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! run · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! : run · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
