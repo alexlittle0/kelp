@@ -149,7 +149,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'git',
     keys: [
-      ['c', 'commit everything in the worktree, asking for the message'],
+      ['c', 'commit what is staged, or with nothing staged everything, asking for the message'],
+      ['+ -', 'stage, unstage the uncommitted file (on "uncommitted": all of them)'],
       ['D', "discard an uncommitted file's changes (twice)"],
       ['y', 'copy the path of the file or worktree'],
       ['e', 'open the file or worktree in $EDITOR (nvim by default)'],
@@ -178,7 +179,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
 // ---- Types ----
 
 // A changed file: its path in the worktree, its line counts, and whether it is new, deleted or binary.
-type Change = { path: string; added: number; removed: number; tag: '' | 'new' | 'deleted' | 'binary' | 'conflict'; isUntracked?: boolean }
+// An uncommitted one may be staged, all of it or only partly, with more changes since.
+type Change = { path: string; added: number; removed: number; tag: '' | 'new' | 'deleted' | 'binary' | 'conflict'; isUntracked?: boolean; stage?: 'staged' | 'partly' }
 
 type Commit = { hash: string; at: number; subject: string; files: Change[] }
 
@@ -451,7 +453,9 @@ const readUncommitted = async (path: string) => {
     // Both sides added, both deleted, or either side unmerged: a conflict left by a merge.
     const isConflict = code === 'AA' || code === 'DD' || code.includes('U')
     const tag = isConflict ? 'conflict' : code.includes('D') ? 'deleted' : code.includes('A') ? 'new' : count === null ? 'binary' : ''
-    changes.push({ path: file, added: count?.[0] ?? 0, removed: count?.[1] ?? 0, tag })
+    // The first letter is the index's, the second the working tree's.
+    const stage = isConflict || code[0] === ' ' ? undefined : code[1] === ' ' ? 'staged' : 'partly'
+    changes.push({ path: file, added: count?.[0] ?? 0, removed: count?.[1] ?? 0, tag, ...(stage && { stage }) })
   }
 
   return changes
@@ -1507,7 +1511,8 @@ const buildRows = (
     const tag = change.tag ? ` ${change.tag}` : ''
     const shared = tree.isBase ? [] : (others.get(change.path) ?? []).filter(b => b !== label(tree))
     const also = shared.length > 0 ? ` also in ${shared.join(', ')}` : ''
-    const path = fitPath(change.path, Math.max(8, room(2) - 2 - stats.length - tag.length - also.length))
+    const staged = change.stage === 'staged' ? ' staged' : change.stage === 'partly' ? ' partly staged' : ''
+    const path = fitPath(change.path, Math.max(8, room(2) - 2 - stats.length - tag.length - staged.length - also.length))
     const file = `${tree.path}/${change.path}`
     rows.push({
       key,
@@ -1518,10 +1523,11 @@ const buildRows = (
       line: 1,
       node: (
         <Text wrap="truncate-end">
-          {open ? '▾' : '▸'} <Text bold={open}>{path}</Text>
+          {open ? '▾' : '▸'} <Text bold={open} color={change.stage === 'staged' ? 'green' : undefined}>{path}</Text>
           {stats && <Text color="green"> +{change.added}</Text>}
           {stats && <Text color="red"> -{change.removed}</Text>}
           {tag && <Text color={change.tag === 'deleted' || isConflict ? 'red' : change.tag === 'new' ? 'blue' : undefined} dimColor={change.tag === 'binary'}>{tag}</Text>}
+          {staged && <Text color="green">{staged}</Text>}
           {also && <Text color="yellow">{also}</Text>}
         </Text>
       ),
@@ -1612,6 +1618,10 @@ const buildRows = (
       details.push({ text: agent.says!.length > 60 ? `${agent.says!.slice(0, 59)}…` : agent.says! })
     }
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
+    // How much of it is staged, a partly staged file counting on both sides.
+    const staged = tree.uncommitted.filter(c => c.stage).length
+    const unstaged = tree.uncommitted.filter(c => c.stage !== 'staged').length
+    if (staged > 0) details.push({ text: `${staged} staged`, color: 'green' }, ...(unstaged > 0 ? [{ text: `${unstaged} unstaged` }] : []))
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind` })
     // Fully in the base and nothing uncommitted: safe to remove.
@@ -2570,22 +2580,40 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
-  // Asks for a message, then commits everything uncommitted in the worktree under the cursor, untracked files included.
+  // Asks for a message, then commits what is staged in the worktree under the cursor, or with nothing staged
+  // everything uncommitted, untracked files included.
   const commitAll = () => {
     const tree = treeUnder()
     if (!tree) return
     const name = label(tree)
     const n = tree.uncommitted.length
     if (n === 0) return setNotice(`${name} has nothing to commit.`)
-    ask(`commit ${n} file${n === 1 ? '' : 's'} in ${name}:`, async message => {
+    const staged = tree.uncommitted.filter(c => c.stage).length
+    const what = staged > 0 ? `the ${plural(staged, 'staged file')}` : `all ${plural(n, 'file')}`
+    ask(`commit ${what} in ${name}:`, async message => {
       if (!message) return setNotice('Nothing committed: the message was empty.')
       setNotice(`Committing in ${name}…`)
-      const added = await gitRun(tree.path, ['add', '-A'])
+      const added = staged > 0 ? { code: 0 } : await gitRun(tree.path, ['add', '-A'])
       const run = added?.code === 0 ? await gitRun(tree.path, ['commit', '--quiet', '-m', message]) : null
       const hash = (await git(tree.path, ['rev-parse', '--short', 'HEAD']))?.trim()
       await refresh.current()
       setNotice(run?.code === 0 ? `Committed ${hash} ${message} in ${name}.` : `The commit failed: run git commit in ${shortPath(tree.path)} to see why.`)
     })
+  }
+
+  // Stages (+) or unstages (-) the uncommitted file under the cursor, or on a worktree's "uncommitted" line all its files.
+  const stage = async (isStage: boolean) => {
+    const tree = treeUnder()
+    const isAll = tab === 'worktrees' && tree !== undefined && row?.key === `tree\t${tree.path}\tuncommitted`
+    const under = isAll ? undefined : uncommittedUnder()
+    const dir = isAll ? tree!.path : under?.dir
+    if (!dir) return setNotice(`Put the cursor on an uncommitted file, or the "uncommitted" line for all of them, to ${isStage ? 'stage' : 'unstage'} it.`)
+    const what = isAll ? `every file in ${label(tree!)}` : under!.file
+    const target = isAll ? [] : ['--', `:(literal)${under!.file}`]
+    const run = await gitRun(dir, isStage ? ['add', '-A', ...target] : ['reset', '-q', ...target])
+    await refresh.current()
+    if (run?.code !== 0) return setNotice(`Could not ${isStage ? 'stage' : 'unstage'} ${what}: run git status in ${shortPath(dir)} to see why.`)
+    setNotice(`${isStage ? 'Staged' : 'Unstaged'} ${what}.`)
   }
 
   // Removes the worktree under the cursor on a second press of x, or of X to force it past uncommitted changes
@@ -2741,6 +2769,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'm' && tab === 'worktrees') act('land')
     else if (input === 'c' && !key.ctrl) commitAll()
     else if (input === 'D') discard()
+    else if (input === '+' || input === '-') stage(input === '+')
     else if (input === 'A') nextWaiting()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
@@ -2850,7 +2879,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     </Text>
   )
   // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
-  const discardKey = uncommittedUnder() ? ' · D discard' : ''
+  const isUncommittedLine = tab === 'worktrees' && row?.key.endsWith('\tuncommitted') === true
+  const discardKey = uncommittedUnder() ? ' · +/- stage · D discard' : isUncommittedLine ? ' · +/- stage all' : ''
   // The merge keys for the worktree under the cursor: carrying on or aborting what is under way, else merging the base in.
   const cursorTree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
@@ -2859,7 +2889,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
