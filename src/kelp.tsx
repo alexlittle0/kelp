@@ -1215,6 +1215,7 @@ const readUsage = (file: string) => {
     usage.offset += end
     type Entry = {
       type?: string
+      isSidechain?: boolean
       message?: {
         id?: string
         model?: string
@@ -1248,7 +1249,8 @@ const readUsage = (file: string) => {
       tokens.write1h += write1h
       tokens.read += u.cache_read_input_tokens ?? 0
       usage.models.set(model, tokens)
-      if (model !== '<synthetic>') {
+      // A subagent's messages, which older transcripts keep among the session's own, fill its context, not the session's.
+      if (model !== '<synthetic>' && !entry.isSidechain) {
         usage.model = model
         usage.context = (u.input_tokens ?? 0) + written + (u.cache_read_input_tokens ?? 0)
       }
@@ -1306,12 +1308,24 @@ const dollarsOf = (model: string, t: Tokens) => {
 const windowOf = (model: string, context: number) =>
   model.endsWith('[1m]') || context > 200_000 || !/^claude-(3\b|\w+-4(-[0-5])?$)/.test(modelName(model)) ? 1_000_000 : 200_000
 
-// What the session of a claude in `cwd` has used, from its newest transcript; undefined when it has none.
+// The transcripts of the subagents a session started, which claude keeps in <session>/subagents/ beside its own.
+const subagentTranscripts = (file: string) => {
+  const dir = `${file.replace(/\.jsonl$/, '')}/subagents`
+  try {
+    return readdirSync(dir).filter(f => f.endsWith('.jsonl')).map(f => `${dir}/${f}`)
+  } catch {
+    return []
+  }
+}
+
+// What the session of a claude in `cwd` has used, from its newest transcript, its subagents' counted in;
+// undefined when it has none. Its context is its own.
 const claudeSpend = (cwd: string): Spend | undefined => {
   const transcript = newestTranscript(cwd)
   const usage = transcript && readUsage(transcript.file)
   if (!usage) return undefined
-  const used = [...usage.models].map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
+  const all = [usage, ...subagentTranscripts(transcript.file).flatMap(f => readUsage(f) ?? [])].flatMap(u => [...u.models])
+  const used = all.map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
   const costs = used.map(m => dollarsOf(m.model, m.t))
 
   return {
