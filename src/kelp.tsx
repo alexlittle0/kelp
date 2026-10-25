@@ -72,6 +72,13 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     ],
   },
   {
+    area: 'find',
+    keys: [
+      ['/', 'filter the tab as you type, fzf style; ⏎ keep, esc drop'],
+      ['esc', 'clear the filter'],
+    ],
+  },
+  {
     area: 'files',
     keys: [
       ['o', 'open in nvim at the line under the cursor'],
@@ -201,7 +208,8 @@ type Tab = 'worktrees' | 'repo'
 
 // A one-line question asked in the footer, such as a new branch's name: what it asks, what is typed so far,
 // and what is done with the answer once ⏎ is pressed.
-type Prompt = { label: string; text: string; onDone: (answer: string) => void }
+// `onChange` sees the text after each key, for a filter that narrows as it is typed; `onCancel` is called on esc.
+type Prompt = { label: string; text: string; onDone: (answer: string) => void; onChange?: (text: string) => void; onCancel?: () => void }
 
 // A destructive action waiting for its key to be pressed again on the same row: what it will do, said in the footer.
 type Armed = { input: string; row: string; text: string; run: () => void }
@@ -1049,6 +1057,26 @@ const newLineNumbers = (lines: string[]) => {
 
 // ---- Rows ----
 
+// Whether a `/` filter matches, as fzf does: each word of `query` must turn up, its letters in order but not
+// necessarily together and ignoring case, within one of `fields`. An empty query matches everything.
+const isMatch = (query: string, fields: string[]) =>
+  query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .every(word =>
+      fields.some(field => {
+        const text = field.toLowerCase()
+        let at = 0
+        for (const c of word) {
+          at = text.indexOf(c, at) + 1
+          if (at === 0) return false
+        }
+
+        return true
+      }),
+    )
+
 // A diff's lines under the row `parent`, each knowing where it is in the new file; `colors` when they carry their own.
 const diffRows = (parent: string, file: string, lines: string[], depth: number, colors?: (string | undefined)[]): Row[] => {
   const numbers = newLineNumbers(lines)
@@ -1071,7 +1099,16 @@ const CHECK_PARTS: Record<Pr['checks'], { text: string; color?: string }> = {
 
 // Every line of the view: each worktree's line, and when open its pull request, its uncommitted files and its commits,
 // each open file's diff under it. `columns` is the width rows are laid out in; `prs` the pull requests by branch.
-const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, diffs: Map<string, Diff>, columns: number, prs: Map<string, Pr>) => {
+// With a `query`, only worktrees whose branch or folder name matches it, all of them shown, and of the rest
+// only the files that match, their groups opened.
+const buildRows = (
+  repo: Repo,
+  isOpen: (key: string, byDefault: boolean) => boolean,
+  diffs: Map<string, Diff>,
+  columns: number,
+  prs: Map<string, Pr>,
+  query: string,
+) => {
   const rows: Row[] = []
   const wanted: Wanted[] = []
   const others = touchedBy(repo)
@@ -1147,10 +1184,17 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
 
   for (const tree of repo.trees) {
     const key = `tree\t${tree.path}`
+    const name = label(tree)
+    const fields = [name, tree.path.split('/').pop() ?? '']
+    const isWhole = isMatch(query, fields)
+    const shows = (file: string) => isWhole || isMatch(query, [...fields, file])
+    const conflicts = tree.conflicts.filter(shows)
+    const uncommitted = tree.uncommitted.filter(c => shows(c.path))
+    const commits = tree.commits.map(c => ({ ...c, files: c.files.filter(f => shows(f.path)) })).filter(c => isWhole || c.files.length > 0)
+    if (!isWhole && conflicts.length + uncommitted.length + commits.length === 0) continue
     // Worktrees start closed, one line each; a blank line sets one apart only after one left open.
     if (rows.length > 0 && rows[rows.length - 1].depth > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
     const open = isOpen(key, false)
-    const name = label(tree)
     const parts: { text: string; color?: string }[] = []
     const run = runs.get(tree.path)
     if (run) {
@@ -1243,10 +1287,10 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
         rows.push({ key: `${prKey}\t${name}`, parent: prKey, depth: 2, node: <Text color="red" wrap="truncate-end">✗ {name}</Text> })
       }
     }
-    if (tree.conflicts.length > 0) {
+    if (conflicts.length > 0) {
       const group = `${key}\tconflicts`
-      if (groupLine(group, key, { text: '⚠ conflicts', color: 'red' }, `merging ${repo.base} in`, '', tree.conflicts.length, true)) {
-        for (const file of tree.conflicts) fileRows(tree, { path: file, added: 0, removed: 0, tag: 'conflict' }, group)
+      if (groupLine(group, key, { text: '⚠ conflicts', color: 'red' }, `merging ${repo.base} in`, '', conflicts.length, true)) {
+        for (const file of conflicts) fileRows(tree, { path: file, added: 0, removed: 0, tag: 'conflict' }, group)
       }
     }
 
@@ -1279,15 +1323,15 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       }
     }
 
-    if (tree.uncommitted.length > 0) {
+    if (uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
-      if (groupLine(group, key, { text: '● uncommitted', color: 'yellow' }, '', '', tree.uncommitted.length, true)) {
-        for (const change of tree.uncommitted) fileRows(tree, change, group)
+      if (groupLine(group, key, { text: '● uncommitted', color: 'yellow' }, '', '', uncommitted.length, true)) {
+        for (const change of uncommitted) fileRows(tree, change, group)
       }
     }
-    for (const commit of tree.commits) {
+    for (const commit of commits) {
       const group = `${key}\t${commit.hash}`
-      if (groupLine(group, key, { text: commit.hash, color: 'yellow' }, commit.subject, ` · ${ago(commit.at)}`, commit.files.length, false)) {
+      if (groupLine(group, key, { text: commit.hash, color: 'yellow' }, commit.subject, ` · ${ago(commit.at)}`, commit.files.length, !isWhole)) {
         for (const change of commit.files) fileRows(tree, change, group, commit.hash)
         if (commit.files.length === 0) note(`${group}\tnone`, group, 2, 'No file changes.')
       }
@@ -1296,6 +1340,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       note(`${key}\tnone`, key, 1, `Nothing ahead of ${repo.base} and no uncommitted changes.`)
     }
   }
+  if (query && rows.length === 0) note('none', '', 0, `No worktree, nor any file changed in one, matches "${query}".`)
 
   return { rows, wanted }
 }
@@ -1309,7 +1354,8 @@ const statusOf = (code: string) =>
 
 // The repo tab's lines: the worktree's folders first then its files, each open folder's insides under it,
 // and under an open file the file itself or, with `isDiff`, its diff against HEAD.
-const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) => boolean, views: Map<string, Diff>, isDiff: boolean) => {
+// With a `query`, only the files whose path matches it, with the folders holding them opened.
+const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) => boolean, views: Map<string, Diff>, isDiff: boolean, query: string) => {
   const rows: Row[] = []
   const wanted: Wanted[] = []
   const note = (key: string, parent: string, depth: number, text: string) =>
@@ -1322,7 +1368,8 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
 
     return inside.get(dir)!
   }
-  for (const file of files.files) {
+  const matching = files.files.filter(file => isMatch(query, [file]))
+  for (const file of matching) {
     const parts = file.split('/')
     for (let k = 1; k < parts.length; k++) at(parts.slice(0, k - 1).join('/')).dirs.add(parts.slice(0, k).join('/'))
     at(parts.slice(0, -1).join('/')).files.push(file)
@@ -1332,13 +1379,14 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
   const walk = (dir: string, parent: string | undefined, depth: number) => {
     for (const sub of [...at(dir).dirs].sort()) {
       const key = `dir\t${sub}`
-      const open = isOpen(key, false)
+      const open = isOpen(key, query !== '')
       const count = changed.filter(f => f.startsWith(`${sub}/`)).length
       rows.push({
         key,
         parent,
         depth,
         canOpen: true,
+        isOpenByDefault: query !== '',
         node: (
           <Text wrap="truncate-end">
             <Text dimColor>{open ? '▾' : '▸'} </Text>
@@ -1407,7 +1455,7 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
     }
   }
   walk('', undefined, 0)
-  if (files.files.length === 0) note('none', '', 0, 'No files.')
+  if (matching.length === 0) note('none', '', 0, query ? `No files match "${query}".` : 'No files.')
 
   return { rows, wanted }
 }
@@ -1494,6 +1542,8 @@ const App = ({ root }: { root: string }) => {
   const [armed, setArmed] = useState<Armed | null>(null)
   // Whether `?`'s list of keys covers the rows.
   const [isHelp, setIsHelp] = useState(false)
+  // Each tab's `/` filter, '' for none.
+  const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
   // Each tab keeps its own cursor and scroll.
   const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
@@ -1615,7 +1665,9 @@ const App = ({ root }: { root: string }) => {
   const columns = Math.max(20, size.columns - 3)
   const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
   const { rows, wanted } =
-    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns, prs) : empty
+    tab === 'repo'
+      ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
+      : repo ? buildRows(repo, isOpen, diffs, columns, prs, filters.worktrees) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
@@ -1723,7 +1775,8 @@ const App = ({ root }: { root: string }) => {
   }
 
   // Asks `label` in the footer, then calls `onDone` with the answer, unless esc is pressed.
-  const ask = (label: string, onDone: (answer: string) => void, text = '') => setPrompt({ label, text, onDone })
+  const ask = (label: string, onDone: (answer: string) => void, text = '', more: Pick<Prompt, 'onChange' | 'onCancel'> = {}) =>
+    setPrompt({ label, text, onDone, ...more })
 
   // Runs `run` when `input` is pressed a second time on the same row; the first press says `text` in the footer.
   const confirm = (input: string, text: string, run: () => void) => {
@@ -1826,15 +1879,22 @@ const App = ({ root }: { root: string }) => {
   // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
   const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
     const p = promptRef.current!
-    if (key.escape) return setPrompt(null)
+    if (key.escape) {
+      setPrompt(null)
+      return p.onCancel?.()
+    }
     if (key.return) {
       setPrompt(null)
       return p.onDone(p.text.trim())
     }
-    if (key.backspace || key.delete) return setPrompt({ ...p, text: p.text.slice(0, -1) })
-    if (key.ctrl && input === 'u') return setPrompt({ ...p, text: '' })
-    if (key.ctrl || key.meta) return
-    setPrompt({ ...p, text: p.text + input.replace(/[\r\n\t]/g, '') })
+    const text =
+      key.backspace || key.delete ? p.text.slice(0, -1)
+      : key.ctrl && input === 'u' ? ''
+      : key.ctrl || key.meta ? p.text
+      : p.text + input.replace(/[\r\n\t]/g, '')
+    if (text === p.text) return
+    setPrompt({ ...p, text })
+    p.onChange?.(text)
   }
 
   // The folder of the worktree under the cursor, or in the repo tab the one it explores.
@@ -1890,6 +1950,12 @@ const App = ({ root }: { root: string }) => {
       if (input === '?' || input === 'q' || key.escape) setIsHelp(false)
     }
     else if (input === '?') setIsHelp(true)
+    else if (input === '/') {
+      // Narrows the tab as the filter is typed; ⏎ keeps it, esc drops it.
+      const filterBy = (text: string) => setFilters(cur => ({ ...cur, [tab]: text.trim() }))
+      ask('/', filterBy, filters[tab], { onChange: filterBy, onCancel: () => filterBy('') })
+    }
+    else if (key.escape && filters[tab]) setFilters(cur => ({ ...cur, [tab]: '' }))
     else if (input === 'q') exit()
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
@@ -1972,6 +2038,7 @@ const App = ({ root }: { root: string }) => {
   const header = (
     <Text wrap="truncate-end">
       <Text bold>kelp</Text>  {tabName('worktrees')} {tabName('repo')}
+      {filters[tab] && <Text color="yellow">  /{filters[tab]}</Text>}
       {tab === 'worktrees' && repo && (
         <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
       )}
@@ -1987,11 +2054,12 @@ const App = ({ root }: { root: string }) => {
   )
   // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
   const discardKey = uncommittedUnder() ? ' · D discard' : ''
+  const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
   const keys = isHelp
     ? '? esc close'
     : tab === 'repo'
-      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · u merge ${repo?.base ?? 'base'} in · ? keys · q quit`
+      ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
+      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · u merge ${repo?.base ?? 'base'} in · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
