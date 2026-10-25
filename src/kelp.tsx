@@ -80,6 +80,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'find',
     keys: [
+      ['s', 'worktrees by name, recent activity, or needing attention first'],
       ['/', 'filter the tab as you type, fzf style; ⏎ keep, esc drop'],
       ['esc', 'clear the filter'],
     ],
@@ -226,7 +227,11 @@ type Tab = 'worktrees' | 'repo'
 
 // What kelp remembers across restarts: the tab, the rows opened or closed against how they start,
 // each tab's cursor and filter, and whether the repo tab shows diffs.
-type Saved = { tab: Tab; toggled: string[]; cursors: Record<Tab, string>; filters: Record<Tab, string>; isDiff: boolean }
+type Saved = { tab: Tab; toggled: string[]; cursors: Record<Tab, string>; filters: Record<Tab, string>; isDiff: boolean; sort: Sort }
+
+// The order of the worktrees after the base branch's, which always comes first: by name, by recent activity,
+// or those that want a look first.
+type Sort = 'name' | 'recent' | 'attention'
 
 // A one-line question asked in the footer, such as a new branch's name: what it asks, what is typed so far,
 // and what is done with the answer once ⏎ is pressed.
@@ -1139,6 +1144,27 @@ const newLineNumbers = (lines: string[]) => {
   })
 }
 
+// The orders `s` steps through, the first the default, and how the header names each.
+const SORTS: Sort[] = ['name', 'recent', 'attention']
+const SORT_NAMES: Record<Sort, string> = { name: 'by name', recent: 'by recent activity', attention: 'needing attention first' }
+
+// How much a worktree wants a look: trouble merging or rebasing, then a busy agent, then uncommitted changes.
+const attention = (tree: Tree) =>
+  tree.conflicts.length > 0 || tree.isMerging || tree.isRebasing ? 3
+  : tree.agents.some(a => a.isBusy !== false) ? 2
+  : tree.uncommitted.length > 0 ? 1
+  : 0
+
+// The worktrees in `sort`'s order, the base branch's first; ties go to the most recently active.
+const sortTrees = (trees: Tree[], sort: Sort) =>
+  [...trees].sort(
+    (a, b) =>
+      Number(b.isBase) - Number(a.isBase) ||
+      (sort === 'name' ? label(a).localeCompare(label(b)) : 0) ||
+      (sort === 'attention' ? attention(b) - attention(a) : 0) ||
+      b.lastAt - a.lastAt,
+  )
+
 // ---- Rows ----
 
 // Whether a `/` filter matches, as fzf does: each word of `query` must turn up, its letters in order but not
@@ -1715,6 +1741,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const [diffs, setDiffs] = useState(new Map<string, Diff>())
   // Whether the repo tab shows an open file or its diff against HEAD.
   const [isDiff, setIsDiff] = useState(saved.isDiff === true)
+  const [sort, setSort] = useState<Sort>(SORTS.find(s => s === saved.sort) ?? SORTS[0])
   const [notice, setNotice] = useState('')
   // What kelp is doing to each worktree, by its folder.
   const [jobs, setJobs] = useState(new Map<string, Job>())
@@ -1754,11 +1781,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
   // Remembers the view a moment after it last changed, and on quitting, so a restart opens it as it was.
   useEffect(() => {
-    latest = { tab, toggled: [...toggled].slice(-MAX_TOGGLED), cursors, filters, isDiff }
+    latest = { tab, toggled: [...toggled].slice(-MAX_TOGGLED), cursors, filters, isDiff, sort }
     const timer = setTimeout(() => latest && save(STATE_FILE, latest), SAVE_MS)
 
     return () => clearTimeout(timer)
-  }, [tab, toggled, cursors, filters, isDiff])
+  }, [tab, toggled, cursors, filters, isDiff, sort])
 
   useEffect(() => {
     const onResize = () => setSize({ columns: stdout.columns, rows: stdout.rows })
@@ -1869,7 +1896,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const { rows, wanted } =
     tab === 'repo'
       ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
-      : repo ? buildRows(repo, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
+      : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
@@ -2226,6 +2253,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       if (input === '?' || input === 'q' || key.escape) setIsHelp(false)
     }
     else if (input === '?') setIsHelp(true)
+    else if (input === 's' && tab === 'worktrees') setSort(SORTS[(SORTS.indexOf(sort) + 1) % SORTS.length])
     else if (input === '/') {
       // Narrows the tab as the filter is typed; ⏎ keeps it, esc drops it.
       const filterBy = (text: string) => setFilters(cur => ({ ...cur, [tab]: text.trim() }))
@@ -2320,7 +2348,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       <Text bold>kelp</Text>  {tabName('worktrees')} {tabName('repo')}
       {filters[tab] && <Text color="yellow">  /{filters[tab]}</Text>}
       {tab === 'worktrees' && repo && (
-        <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
+        <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}{sort !== SORTS[0] && ` · ${SORT_NAMES[sort]}`}</Text>
       )}
       {tab === 'worktrees' && conflicting > 0 && (
         <Text color="red"> · {conflicting} would conflict</Text>
