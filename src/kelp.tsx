@@ -126,7 +126,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'files',
     keys: [
-      ['o', 'open in nvim at the line under the cursor'],
+      ['o', "open in nvim at the line under the cursor, or the file a claude's tool call names"],
       ['d', 'repo tab: show files or diffs vs HEAD'],
     ],
   },
@@ -2635,6 +2635,8 @@ const buildRows = (
             parent: group,
             depth: 2,
             canOpen: true,
+            // The file it read or edited, which `o` and `e` open, from its lines too.
+            ...(turn.file && { file: turn.file, line: 1 }),
             node: (
               <Text wrap="truncate-end">
                 <Text dimColor>{isTurnOpen ? '▾' : '▸'} {here(turn.text)}</Text>
