@@ -74,6 +74,15 @@ const AGAIN_MS = 2000
 const TRANSCRIPT_TAIL = 256 * 1024
 // How much of a transcript is read at most each refresh to count its tokens, so a long one is caught up over a few.
 const USAGE_CHUNK = 4 * 1024 * 1024
+// How much of the end of a claude transcript its conversation is read from, the entries of it kept,
+// and the characters of a prompt or reply kept.
+const CONVERSATION_TAIL = 1024 * 1024
+const MAX_TURNS = 50
+const MAX_TURN_TEXT = 4000
+// Lines of a reply or prompt shown before it is opened for the rest, and of a tool call's input and result shown once opened.
+const REPLY_LINES = 3
+const TOOL_INPUT_LINES = 6
+const TOOL_RESULT_LINES = 8
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
 const LONG_TOOLS = ['Agent', 'Task', 'WebFetch', 'WebSearch']
 // The ports handed to worktrees, one each from a hash of its branch, so it stays the same across restarts.
@@ -253,8 +262,9 @@ type Tree = {
 
 // A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
 // for the person (its turn done, or with `isAsking` asking leave to run a tool), what it last said or asks to run,
-// while busy when its turn began, and else when it went quiet, ms since the epoch. `spend` is what its session has used so far.
-type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number; idleAt?: number; spend?: Spend }
+// while busy when its turn began, and else when it went quiet, ms since the epoch. `spend` is what its session has used so far,
+// `session` names its session and `turns` are its conversation's latest entries.
+type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number; idleAt?: number; spend?: Spend; session?: string; turns?: Turn[] }
 
 // Tokens a claude used, by kind: its prompts' new input, its output, cache writes (kept 5 minutes or an hour,
 // which cost differently) and cache reads.
@@ -263,6 +273,11 @@ type Tokens = { input: number; output: number; write5m: number; write1h: number;
 // What a claude's session has used: its tokens, all kinds together, and what they cost in dollars,
 // undefined when a model it used has no known price; and how full its context window is, 0 to 1.
 type Spend = { tokens: number; dollars?: number; context: number }
+
+// An entry of a claude's conversation: a prompt of the person's, a text reply of claude's, or a tool it called as one line
+// ("Edit src/kelp.tsx"), with the start of its input and of its result, `more` lines of that left out, `isFailed` when
+// it was an error. `key` stays the same across reads: a tool call's id, else the transcript line's and the block's place in it.
+type Turn = { key: string; kind: 'prompt' | 'reply' | 'tool'; text: string; input?: string[]; result?: string[]; more?: number; isFailed?: boolean; file?: string }
 
 // How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working;
 // `turnAt` when the person last prompted it, 0 when that is not in the part read.
@@ -996,6 +1011,104 @@ const readEnding = (file: string, at: number): Ending | null => {
   return ending
 }
 
+// The transcript of the claude `pid` running in `cwd`, its session's own as ~/.claude/sessions/<pid>.json names it,
+// else the newest there; with its session's name and when it was written. Null when there is none.
+const transcriptOf = (pid: number, cwd: string) => {
+  try {
+    const session = JSON.parse(readFileSync(`${homedir()}/.claude/sessions/${pid}.json`, 'utf8'))
+    const file = `${homedir()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${session.sessionId}.jsonl`
+    if (existsSync(file)) return { file, at: modifiedAt(file), name: String(session.name || session.sessionId.slice(0, 8)) }
+  } catch {
+    // No session file, as with an older claude.
+  }
+  const newest = newestTranscript(cwd)
+
+  return newest && { ...newest, name: basename(newest.file, '.jsonl').slice(0, 8) }
+}
+
+// Adds the conversation entries in transcript `lines` to `turns`: prompts and replies, and tool calls, each given its
+// result once that comes. Thinking, sidechains (a subagent's own talk) and what claude adds itself, such as
+// "<command-name>" lines and reminders, are left out. Only the last MAX_TURNS are kept.
+const addTurns = (turns: Turn[], lines: string[]) => {
+  type Line = { type?: string; uuid?: string; isMeta?: boolean; isSidechain?: boolean; message?: { content?: unknown } }
+  type Block = { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string; content?: unknown; is_error?: boolean }
+  const cut = (line: string) => cleanLine(line.slice(0, 200))
+  for (const line of lines) {
+    let entry: Line
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if ((entry.type !== 'user' && entry.type !== 'assistant') || entry.isMeta || entry.isSidechain) continue
+    const content = entry.message?.content
+    const blocks = (typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : []) as Block[]
+    blocks.forEach((block, k) => {
+      const key = block.id ?? `${entry.uuid}:${k}`
+      const text = block.text?.trim() ?? ''
+      if (block.type === 'text' && text) {
+        if (entry.type === 'user' && (/^<[a-z-]+>/.test(text) || text.startsWith('[Request interrupted'))) return
+        turns.push({ key, kind: entry.type === 'user' ? 'prompt' : 'reply', text: text.slice(0, MAX_TURN_TEXT) })
+      } else if (block.type === 'tool_use') {
+        const input = block.input ?? {}
+        const file = [input.file_path, input.notebook_path].find(f => typeof f === 'string') as string | undefined
+        const fields = Object.entries(input).map(([name, value]) => cut(`${name}: ${typeof value === 'string' ? value : JSON.stringify(value)}`.split('\n')[0]))
+        turns.push({ key, kind: 'tool', text: `${block.name} ${toolSubject(input).split('\n')[0]}`.trim(), input: fields.slice(0, TOOL_INPUT_LINES), file })
+      } else if (block.type === 'tool_result') {
+        const turn = turns.findLast(t => t.key === block.tool_use_id)
+        if (!turn) return
+        const parts = (Array.isArray(block.content) ? block.content : [{ type: 'text', text: block.content }]) as Block[]
+        const result = toLines(parts.filter(p => p.type === 'text' && typeof p.text === 'string').map(p => p.text).join('\n').trim())
+        turn.result = result.slice(0, TOOL_RESULT_LINES).map(cut)
+        turn.more = result.length - turn.result.length
+        turn.isFailed = block.is_error === true
+      }
+    })
+  }
+  turns.splice(0, Math.max(0, turns.length - MAX_TURNS))
+}
+
+// Each transcript's conversation as read so far: how far into the file, in bytes, and its latest entries.
+const conversations = new Map<string, { offset: number; turns: Turn[] }>()
+
+// The latest entries of a transcript's conversation. The first read starts CONVERSATION_TAIL from its end;
+// after that only the lines claude has added since are read and parsed.
+const readConversation = (file: string) => {
+  let fd: number
+  try {
+    fd = openSync(file, 'r')
+  } catch {
+    return conversations.get(file)?.turns ?? []
+  }
+  try {
+    const size = fstatSync(fd).size
+    let conversation = conversations.get(file)
+    // Read afresh the first time, when the file got shorter, or when more was added than is worth catching up on.
+    const isAfresh = !conversation || size < conversation.offset || size - conversation.offset > CONVERSATION_TAIL
+    if (!conversation || isAfresh) {
+      conversation = { offset: Math.max(0, size - CONVERSATION_TAIL), turns: [] }
+      conversations.set(file, conversation)
+    }
+    const from = conversation.offset
+    if (size === from) return conversation.turns
+    const buffer = Buffer.alloc(size - from)
+    readSync(fd, buffer, 0, buffer.length, from)
+    // Whole lines only: an unfinished last line, still being written, is read again next time.
+    const end = buffer.lastIndexOf(10) + 1
+    if (end === 0) return conversation.turns
+    conversation.offset += end
+    const lines = buffer.subarray(0, end).toString('utf8').split('\n')
+    // Starting partway into the file, its first line is likely cut short.
+    addTurns(conversation.turns, isAfresh && from > 0 ? lines.slice(1) : lines)
+
+    return conversation.turns
+  } catch {
+    return conversations.get(file)?.turns ?? []
+  } finally {
+    closeSync(fd)
+  }
+}
+
 // When the machine started, ms since the epoch, which /proc's process start times count from.
 let bootedAt = 0
 const bootTime = () => {
@@ -1028,9 +1141,8 @@ const hasChildSince = (pid: number, since: number) => {
   }
 }
 
-// What a claude in `cwd` is up to, from how its newest transcript ends.
-const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'isAsking' | 'says' | 'turnAt' | 'idleAt'> => {
-  const transcript = newestTranscript(cwd)
+// What a claude is up to, from how its transcript ends.
+const claudeState = (pid: number, transcript: { file: string; at: number } | null): Pick<Agent, 'isBusy' | 'isWaiting' | 'isAsking' | 'says' | 'turnAt' | 'idleAt'> => {
   if (!transcript) return { isBusy: false }
   const ending = readEnding(transcript.file, transcript.at)
   const quiet = Date.now() - transcript.at
@@ -1081,7 +1193,13 @@ const findAgents = () => {
 
   return found
     .filter(a => !ids.has(a.parent))
-    .map(({ name, pid, cwd }): Agent & { cwd: string } => (name === 'claude' ? { name, pid, cwd, ...claudeState(pid, cwd), spend: claudeSpend(cwd) } : { name, pid, cwd }))
+    .map(({ name, pid, cwd }): Agent & { cwd: string } => {
+      if (name !== 'claude') return { name, pid, cwd }
+      const transcript = transcriptOf(pid, cwd)
+      const chat = transcript ? { session: transcript.name, turns: readConversation(transcript.file) } : {}
+
+      return { name, pid, cwd, ...claudeState(pid, transcript), spend: claudeSpend(cwd), ...chat }
+    })
 }
 
 // Every tmux pane but kelp's own and the folder it is in, when kelp runs inside tmux.
@@ -1783,6 +1901,27 @@ const fitPath = (file: string, room: number) => {
   return `${name.slice(0, Math.max(1, room - 1))}…`
 }
 
+// A text cut into lines of at most `width` columns, at spaces where it can, its own line breaks kept
+// and its blank lines left out.
+const wrapText = (text: string, width: number) =>
+  text.split('\n').flatMap(paragraph => {
+    const lines: string[] = []
+    let line = ''
+    for (const word of paragraph.replace(/\r$/, '').replace(/\t/g, '  ').replace(/[\x00-\x1f\x7f]/g, '·').split(' ')) {
+      if (line && line.length + 1 + word.length > width) {
+        lines.push(line)
+        line = ''
+      }
+      line = line ? `${line} ${word}` : word
+      while (line.length > width) {
+        lines.push(line.slice(0, width))
+        line = line.slice(width)
+      }
+    }
+
+    return [...lines, line].filter(l => l.trim())
+  })
+
 const ago = (at: number) => {
   const minutes = Math.floor((Date.now() - at) / 60_000)
   if (minutes < 1) return 'just now'
@@ -1809,21 +1948,6 @@ const runState = (run: Run) => {
   if (run.code === 0) return { mark: '✓', color: 'green', text: `exit 0 · ${took}` }
 
   return { mark: '✗', color: 'red', text: `${run.code === null ? 'stopped' : `exit ${run.code}`} · ${took}` }
-}
-
-// A text cut into lines of at most `width` columns, at spaces where it can.
-const wrapText = (text: string, width: number) => {
-  const lines: string[] = []
-  let rest = text.trim()
-  while (rest.length > width) {
-    const space = rest.lastIndexOf(' ', width)
-    const at = space > 0 ? space : width
-    lines.push(rest.slice(0, at))
-    rest = rest.slice(at).trimStart()
-  }
-  if (rest) lines.push(rest)
-
-  return lines
 }
 
 const clockTime = (at: number) => {
@@ -2472,6 +2596,80 @@ const buildRows = (
         if (run.lines.length > RUN_LINES) note(`${group}\tearlier`, group, 2, `… ${run.lines.length - RUN_LINES} earlier lines`)
         if (shown.length === 0) note(`${group}\tnone`, group, 2, isRunning(run) ? 'No output yet.' : 'No output.')
         shown.forEach((line, n) => note(`${group}\t${n}`, group, 2, line || ' '))
+      }
+    }
+
+    // Each claude's conversation, closed: its latest entries, newest at the bottom. A prompt (bold) or reply shows
+    // its first lines until opened; a tool call is one dim line, opening to its input and the start of its result.
+    const claudes = tree.agents.filter(a => a.turns)
+    for (const agent of claudes) {
+      const group = `${key}\tchat\t${agent.session}`
+      const isChatOpen = isOpen(group, false)
+      const state = agent.isWaiting ? { text: 'waiting', color: 'yellow' } : agent.isBusy ? { text: 'working', color: 'green' } : { text: 'idle' }
+      rows.push({
+        key: group,
+        parent: key,
+        depth: 1,
+        canOpen: true,
+        node: (
+          <Text wrap="truncate-end">
+            <Text dimColor>{isChatOpen ? '▾' : '▸'} </Text>
+            claude conversation
+            <Text dimColor>{claudes.length > 1 ? ` · ${agent.session}` : ''} · </Text>
+            <Text color={state.color} dimColor={!state.color}>{state.text}</Text>
+          </Text>
+        ),
+      })
+      if (!isChatOpen) continue
+      const turns = agent.turns!
+      if (turns.length === 0) note(`${group}\tnone`, group, 2, 'Nothing said yet.')
+      // Paths in the worktree are shown from its folder.
+      const here = (text: string) => shortPath(text.replaceAll(`${tree.path}/`, ''))
+      const width = Math.max(10, room(2) - 2)
+      for (const turn of turns) {
+        const at = `${group}\t${turn.key}`
+        if (turn.kind === 'tool') {
+          const isTurnOpen = isOpen(at, false)
+          rows.push({
+            key: at,
+            parent: group,
+            depth: 2,
+            canOpen: true,
+            node: (
+              <Text wrap="truncate-end">
+                <Text dimColor>{isTurnOpen ? '▾' : '▸'} {here(turn.text)}</Text>
+                {turn.isFailed && <Text color="red"> ✗</Text>}
+              </Text>
+            ),
+          })
+          if (!isTurnOpen) continue
+          turn.input?.forEach((line, n) => note(`${at}\tin${n}`, at, 3, here(line)))
+          if (!turn.result) note(`${at}\tpending`, at, 3, 'No result yet.')
+          turn.result?.forEach((line, n) => {
+            rows.push({ key: `${at}\tout${n}`, parent: at, depth: 3, node: <Text color={turn.isFailed ? 'red' : undefined} dimColor={!turn.isFailed} wrap="truncate-end">{n === 0 ? '→ ' : '  '}{line || ' '}</Text> })
+          })
+          if (turn.more) note(`${at}\tmore`, at, 3, `  … ${plural(turn.more, 'more line')}`)
+          continue
+        }
+        const lines = wrapText(turn.text, width)
+        const canOpen = lines.length > REPLY_LINES
+        const isTurnOpen = canOpen && isOpen(at, false)
+        const shown = isTurnOpen ? lines : lines.slice(0, REPLY_LINES)
+        shown.forEach((line, n) => {
+          rows.push({
+            key: n === 0 ? at : `${at}\t${n}`,
+            parent: n === 0 || !canOpen ? group : at,
+            depth: 2,
+            canOpen: n === 0 && canOpen,
+            node: (
+              <Text wrap="truncate-end">
+                <Text dimColor>{n === 0 && canOpen ? (isTurnOpen ? '▾ ' : '▸ ') : '  '}</Text>
+                <Text bold={turn.kind === 'prompt'}>{line}</Text>
+                {canOpen && !isTurnOpen && n === shown.length - 1 && <Text dimColor> …</Text>}
+              </Text>
+            ),
+          })
+        })
       }
     }
 
