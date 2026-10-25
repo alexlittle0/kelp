@@ -22,11 +22,23 @@ const MAX_REPO_FILES = 20_000
 const NOTICE_MS = 4000
 // Lines the view moves per turn of the mouse wheel.
 const WHEEL_LINES = 3
+// Lines shown around each conflict.
+const CONFLICT_CONTEXT = 2
+// Who `git stash create` says made its commit, and when: fixed, so the same edits make the same commit
+// and refreshing writes no new objects.
+const STASH_ENV = {
+  GIT_AUTHOR_NAME: 'kelp',
+  GIT_AUTHOR_EMAIL: 'kelp@localhost',
+  GIT_AUTHOR_DATE: '@0 +0000',
+  GIT_COMMITTER_NAME: 'kelp',
+  GIT_COMMITTER_EMAIL: 'kelp@localhost',
+  GIT_COMMITTER_DATE: '@0 +0000',
+}
 
 // ---- Types ----
 
 // A changed file: its path in the worktree, its line counts, and whether it is new, deleted or binary.
-type Change = { path: string; added: number; removed: number; tag: '' | 'new' | 'deleted' | 'binary'; isUntracked?: boolean }
+type Change = { path: string; added: number; removed: number; tag: '' | 'new' | 'deleted' | 'binary' | 'conflict'; isUntracked?: boolean }
 
 type Commit = { hash: string; at: number; subject: string; files: Change[] }
 
@@ -40,6 +52,12 @@ type Tree = {
   behind: number
   commits: Commit[]
   uncommitted: Change[]
+  // Merging the base in, worked out in memory: the merged tree ('' when not worked out, as nothing is behind
+  // or a merge is under way) and the files that would conflict.
+  merged: string
+  conflicts: string[]
+  // Whether a merge is under way, its conflicted files among the uncommitted ones.
+  isMerging: boolean
   // Its newest commit or edited file, ms since the epoch.
   lastAt: number
 }
@@ -49,10 +67,14 @@ type Repo = { dir: string; base: string; trees: Tree[] }
 // The files of the worktree the repo tab explores, relative to its folder, and git's status code for each changed one.
 type Files = { dir: string; files: string[]; isCut: boolean; status: Record<string, string> }
 
-// A diff to show under an open file, or with `isWhole` the file itself, and where it comes from.
-type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean }
-// `isUnreadable` when a whole file is binary, too large or missing.
-type Diff = { lines: string[]; isCut: boolean; isUnreadable?: boolean; version: number }
+// A conflict is read from the merged tree, or from the file itself when a merge is under way ('' for `merged`),
+// its markers named for the worktree and the base.
+type Conflict = { merged: string; ours: string; theirs: string }
+// A diff to show under an open file, or with `isWhole` the file itself, or with `conflict` its conflicts, and where it comes from.
+type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean; conflict?: Conflict }
+// `isUnreadable` when a whole file is binary, too large or missing; `colors` when the lines carry their own,
+// else they are coloured as a diff.
+type Diff = { lines: string[]; colors?: (string | undefined)[]; isCut: boolean; isUnreadable?: boolean; version: number }
 
 type Tab = 'worktrees' | 'repo'
 
@@ -74,12 +96,19 @@ type Row = {
 // ---- Git ----
 
 // Git's output, or null when it fails or exits with a code not in `ok`.
-const git = async (cwd: string, args: string[], ok = [0]) => {
+const git = async (cwd: string, args: string[], ok = [0], env?: Record<string, string>) => {
+  const run = await gitRun(cwd, args, env)
+
+  return run && ok.includes(run.code) ? run.out : null
+}
+
+// Git's output and exit code, or null when it cannot be started.
+const gitRun = async (cwd: string, args: string[], env?: Record<string, string>) => {
   try {
-    const proc = Bun.spawn(['git', '-c', 'core.quotePath=false', ...args], { cwd, stdout: 'pipe', stderr: 'ignore' })
+    const proc = Bun.spawn(['git', '-c', 'core.quotePath=false', ...args], { cwd, stdout: 'pipe', stderr: 'ignore', env: env && { ...process.env, ...env } })
     const out = await new Response(proc.stdout).text()
 
-    return ok.includes(await proc.exited) ? out : null
+    return { out, code: await proc.exited }
   } catch {
     return null
   }
@@ -198,23 +227,41 @@ const readUncommitted = async (path: string) => {
       continue
     }
     const count = counts.get(file)
-    const tag = code.includes('D') ? 'deleted' : code.includes('A') ? 'new' : count === null ? 'binary' : ''
+    // Both sides added, both deleted, or either side unmerged: a conflict left by a merge.
+    const isConflict = code === 'AA' || code === 'DD' || code.includes('U')
+    const tag = isConflict ? 'conflict' : code.includes('D') ? 'deleted' : code.includes('A') ? 'new' : count === null ? 'binary' : ''
     changes.push({ path: file, added: count?.[0] ?? 0, removed: count?.[1] ?? 0, tag })
   }
 
   return changes
 }
 
+// What merging the base into the worktree would do, without touching it: `git merge-tree` merges in memory.
+// Uncommitted edits to tracked files count too, through the commit `git stash create` makes of them,
+// which it leaves dangling with the worktree, index and stash list as they were.
+const readConflicts = async (path: string, base: string, hasUncommitted: boolean) => {
+  const stash = hasUncommitted ? (await git(path, ['stash', 'create'], [0], STASH_ENV))?.trim() : ''
+  // Exits 1 when there are conflicts.
+  const text = await git(path, ['merge-tree', '--write-tree', '--name-only', '--no-messages', stash || 'HEAD', base], [0, 1])
+  if (text === null) return { merged: '', conflicts: [] }
+  const [merged, ...files] = text.split('\n\n')[0].split('\n')
+
+  return { merged, conflicts: [...new Set(files.filter(Boolean))] }
+}
+
 const loadTree = async (w: { path: string; head: string; branch: string }, base: string): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
-  const [log, counts, uncommitted, headAt] = await Promise.all([
-    git(w.path, ['log', ...range, '--format=%x01%h%x00%ct%x00%s', '--numstat', '--summary', '--no-renames']),
+  const [log, counts, uncommitted, headAt, mergeHead] = await Promise.all([
+    git(w.path, ['log', ...range, '--format=%x01%h%x00%ct%x00%s', '--numstat', '--summary', '--no-renames', '--diff-merges=first-parent']),
     isBase ? Promise.resolve('0\t0') : git(w.path, ['rev-list', '--left-right', '--count', `${base}...HEAD`]),
     readUncommitted(w.path),
     git(w.path, ['log', '-1', '--format=%ct']),
+    git(w.path, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD']),
   ])
   const [behind, ahead] = (counts ?? '0\t0').trim().split(/\s+/).map(Number)
+  const isMerging = mergeHead !== null
+  const { merged, conflicts } = behind > 0 && !isMerging ? await readConflicts(w.path, base, uncommitted.length > 0) : { merged: '', conflicts: [] }
   const edited = uncommitted.map(c => modifiedAt(`${w.path}/${c.path}`))
 
   return {
@@ -224,6 +271,9 @@ const loadTree = async (w: { path: string; head: string; branch: string }, base:
     behind,
     commits: parseLog(log ?? ''),
     uncommitted,
+    merged,
+    conflicts,
+    isMerging,
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
   }
 }
@@ -240,10 +290,47 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   return { dir, base, trees }
 }
 
+// A conflicted file's conflicts, each with a few lines around it, runs apart split by "…". The worktree's side
+// is blue, the base's magenta, and the common ancestor's (with merge.conflictStyle diff3) dim.
+const readConflict = async (want: Wanted, conflict: Conflict) => {
+  const text = conflict.merged ? await git(want.tree, ['cat-file', 'blob', `${conflict.merged}:${want.file}`]) : readText(`${want.tree}/${want.file}`)
+  const all = (text ?? '').replace(/\n$/, '').split('\n')
+  const kept = new Set<number>()
+  let start = -1
+  all.forEach((line, n) => {
+    if (/^<{7}( |$)/.test(line)) start = n
+    if (/^>{7}( |$)/.test(line) && start !== -1) {
+      for (let k = Math.max(0, start - CONFLICT_CONTEXT); k <= Math.min(all.length - 1, n + CONFLICT_CONTEXT); k++) kept.add(k)
+      start = -1
+    }
+  })
+
+  const lines: string[] = []
+  const colors: (string | undefined)[] = []
+  let side: string | undefined
+  let last = -1
+  all.forEach((line, n) => {
+    const marker = line.match(/^(<{7}|\|{7}|={7}|>{7})( |$)/)?.[1]
+    if (kept.has(n)) {
+      if (last !== -1 && n !== last + 1) {
+        lines.push('…')
+        colors.push(undefined)
+      }
+      last = n
+      lines.push(marker === '<<<<<<<' ? `${marker} ${conflict.ours}` : marker === '>>>>>>>' ? `${marker} ${conflict.theirs}` : line)
+      colors.push(marker ? 'cyan' : side)
+    }
+    if (marker) side = marker[0] === '<' ? 'blue' : marker[0] === '|' ? 'gray' : marker[0] === '=' ? 'magenta' : undefined
+  })
+
+  return { lines: lines.slice(0, MAX_DIFF_LINES), colors: colors.slice(0, MAX_DIFF_LINES), isCut: lines.length > MAX_DIFF_LINES }
+}
+
 // A file's diff from its first hunk on, against HEAD when uncommitted or within its commit.
-const readDiff = async (want: Wanted) => {
+const readDiff = async (want: Wanted): Promise<Omit<Diff, 'version'>> => {
+  if (want.conflict) return readConflict(want, want.conflict)
   const text = want.commit
-    ? await git(want.tree, ['show', '--format=', '--no-renames', want.commit, '--', want.file])
+    ? await git(want.tree, ['show', '--format=', '--no-renames', '--diff-merges=first-parent', want.commit, '--', want.file])
     : want.isUntracked
       ? await git(want.tree, ['diff', '--no-index', '--', '/dev/null', want.file], [0, 1])
       : await git(want.tree, ['diff', 'HEAD', '--no-renames', '--', want.file])
@@ -392,12 +479,12 @@ const newLineNumbers = (lines: string[]) => {
 
 // ---- Rows ----
 
-// A diff's lines under the row `parent`, each knowing where it is in the new file.
-const diffRows = (parent: string, file: string, lines: string[], depth: number): Row[] => {
+// A diff's lines under the row `parent`, each knowing where it is in the new file; `colors` when they carry their own.
+const diffRows = (parent: string, file: string, lines: string[], depth: number, colors?: (string | undefined)[]): Row[] => {
   const numbers = newLineNumbers(lines)
 
   return lines.map((line, n) => {
-    const color = line.startsWith('+') ? 'green' : line.startsWith('-') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined
+    const color = colors ? colors[n] : line.startsWith('+') ? 'green' : line.startsWith('-') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined
 
     return { key: `${parent}\t${n}`, parent, depth, file, line: numbers[n], node: <Text color={color} dimColor={!color} wrap="truncate-end">{line || ' '}</Text> }
   })
@@ -443,7 +530,8 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
   const fileRows = (tree: Tree, change: Change, parent: string, commit?: string) => {
     const key = `${parent}\t${change.path}`
     const open = isOpen(key, false)
-    const stats = change.tag === 'binary' ? '' : ` +${change.added} -${change.removed}`
+    const isConflict = change.tag === 'conflict'
+    const stats = change.tag === 'binary' || isConflict ? '' : ` +${change.added} -${change.removed}`
     const tag = change.tag ? ` ${change.tag}` : ''
     const shared = tree.isBase ? [] : (others.get(change.path) ?? []).filter(b => b !== label(tree))
     const also = shared.length > 0 ? ` also in ${shared.join(', ')}` : ''
@@ -461,17 +549,20 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
           {open ? '▾' : '▸'} <Text bold={open}>{path}</Text>
           {stats && <Text color="green"> +{change.added}</Text>}
           {stats && <Text color="red"> -{change.removed}</Text>}
-          {tag && <Text color={change.tag === 'deleted' ? 'red' : change.tag === 'new' ? 'blue' : undefined} dimColor={change.tag === 'binary'}>{tag}</Text>}
+          {tag && <Text color={change.tag === 'deleted' || isConflict ? 'red' : change.tag === 'new' ? 'blue' : undefined} dimColor={change.tag === 'binary'}>{tag}</Text>}
           {also && <Text color="yellow">{also}</Text>}
         </Text>
       ),
     })
     if (!open) return
-    wanted.push({ key, tree: tree.path, file: change.path, commit, isUntracked: change.isUntracked })
+    const conflict = isConflict ? { merged: tree.isMerging ? '' : tree.merged, ours: label(tree), theirs: repo.base } : undefined
+    wanted.push({ key, tree: tree.path, file: change.path, commit, isUntracked: change.isUntracked, conflict })
     const diff = diffs.get(key)
     if (!diff) return note(`${key}\tloading`, key, 3, 'Loading…')
-    if (diff.lines.length === 0) return note(`${key}\tempty`, key, 3, 'No textual changes.')
-    rows.push(...diffRows(key, file, diff.lines, 3))
+    if (diff.lines.length === 0) {
+      return note(`${key}\tempty`, key, 3, isConflict ? 'Changed on one side, deleted or renamed on the other.' : 'No textual changes.')
+    }
+    rows.push(...diffRows(key, file, diff.lines, 3, diff.colors))
     if (diff.isCut) note(`${key}\tcut`, key, 3, `… diff cut at ${MAX_DIFF_LINES} lines`)
   }
 
@@ -484,6 +575,13 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     if (tree.isBase) parts.push({ text: 'base' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind`, color: 'yellow' })
+    const unresolved = tree.uncommitted.filter(c => c.tag === 'conflict').length
+    if (tree.isMerging) {
+      parts.push({ text: `merging ${repo.base}`, color: 'red' })
+      parts.push(unresolved > 0 ? { text: `⚠ ${unresolved} unresolved`, color: 'red' } : { text: 'resolved, ready to commit', color: 'green' })
+    } else if (tree.conflicts.length > 0) {
+      parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'} with ${repo.base}`, color: 'red' })
+    } else if (tree.merged) parts.push({ text: 'merges cleanly' })
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length} uncommitted`, color: 'yellow' })
     if (!tree.isBase && tree.ahead === 0 && tree.uncommitted.length === 0) parts.push({ text: 'nothing new' })
     if (tree.lastAt > 0) parts.push({ text: ago(tree.lastAt) })
@@ -514,6 +612,12 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     })
     if (!open) continue
 
+    if (tree.conflicts.length > 0) {
+      const group = `${key}\tconflicts`
+      if (groupLine(group, key, { text: '⚠ conflicts', color: 'red' }, `merging ${repo.base} in`, '', tree.conflicts.length, true)) {
+        for (const file of tree.conflicts) fileRows(tree, { path: file, added: 0, removed: 0, tag: 'conflict' }, group)
+      }
+    }
     if (tree.uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
       if (groupLine(group, key, { text: '● uncommitted', color: 'yellow' }, '', '', tree.uncommitted.length, true)) {
@@ -667,6 +771,8 @@ const App = ({ root }: { root: string }) => {
   // Whether the repo tab shows an open file or its diff against HEAD.
   const [isDiff, setIsDiff] = useState(false)
   const [notice, setNotice] = useState('')
+  // A merge or abort waiting on a second press ("merge\t<path>"), forgotten with the notice asking for it.
+  const [arming, setArming] = useState('')
   // Each tab keeps its own cursor and scroll.
   const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
@@ -729,7 +835,10 @@ const App = ({ root }: { root: string }) => {
 
   useEffect(() => {
     if (!notice) return
-    const timer = setTimeout(() => setNotice(''), NOTICE_MS)
+    const timer = setTimeout(() => {
+      setNotice('')
+      setArming('')
+    }, NOTICE_MS)
 
     return () => clearTimeout(timer)
   }, [notice])
@@ -826,12 +935,50 @@ const App = ({ root }: { root: string }) => {
     if (clicked.canOpen) toggle(clicked.key)
   }
 
+  // Merges the base into the worktree under the cursor, or aborts the merge it is in, on a second press.
+  // A merge needs nothing uncommitted, and stops with its conflicts in the files for the person to resolve and commit.
+  const act = async (kind: 'merge' | 'abort') => {
+    const tree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
+    if (!repo || !tree) return
+    const name = label(tree)
+    if (kind === 'abort' && !tree.isMerging) return setNotice(`${name} is not merging anything.`)
+    if (kind === 'merge') {
+      if (tree.isBase) return setNotice(`${name} is the base branch.`)
+      if (tree.isMerging) return setNotice(`${name} is already merging ${repo.base}: resolve and commit, or U to abort.`)
+      if (tree.behind === 0) return setNotice(`${name} already has everything in ${repo.base}.`)
+      if (tree.uncommitted.length > 0) return setNotice(`${name} has uncommitted changes: commit them first.`)
+    }
+    const id = `${kind}\t${tree.path}`
+    if (arming !== id) {
+      setArming(id)
+      const n = tree.conflicts.length
+      const leaving = n > 0 ? `, leaving ${n} conflict${n === 1 ? '' : 's'} to resolve` : ''
+
+      return setNotice(kind === 'merge' ? `Press u again to merge ${repo.base} into ${name}${leaving}.` : `Press U again to abort ${name}'s merge and put it back as it was.`)
+    }
+
+    setNotice(kind === 'merge' ? `Merging ${repo.base} into ${name}…` : `Aborting ${name}'s merge…`)
+    const run = await gitRun(tree.path, kind === 'merge' ? ['merge', '--no-edit', repo.base] : ['merge', '--abort'])
+    await refresh.current()
+    if (kind === 'abort') return setNotice(run?.code === 0 ? `Aborted ${name}'s merge.` : `Could not abort: run git merge --abort in ${shortPath(tree.path)} to see why.`)
+    if (run?.code === 0) return setNotice(`Merged ${repo.base} into ${name}.`)
+    if (run?.code === 1) return setNotice(`Merged ${repo.base} into ${name} with conflicts: resolve them and commit, or U to abort.`)
+    setNotice(`The merge failed: run git merge ${repo.base} in ${shortPath(tree.path)} to see why.`)
+  }
+
   useInput((input, key) => {
     const mouse = input.match(/^\[<(\d+);(\d+);(\d+)([Mm])$/)
+    // Any other key forgets a merge or abort waiting on its second press.
+    if (!mouse && arming) {
+      setArming('')
+      setNotice('')
+    }
     if (mouse) {
       if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[2]), Number(mouse[3]))
     }
     else if (input === 'q') exit()
+    else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
+    else if (input === 'U' && tab === 'worktrees') act('abort')
     else if (input === 'r') refresh.current()
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
@@ -861,12 +1008,16 @@ const App = ({ root }: { root: string }) => {
     <Text bold={tab === name} dimColor={tab !== name} underline={tab === name}>{name}</Text>
   )
   const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
+  const conflicting = repo ? repo.trees.filter(t => t.conflicts.length > 0).length : 0
   const changed = files ? Object.keys(files.status).length : 0
   const header = (
     <Text wrap="truncate-end">
       <Text bold>kelp</Text>  {tabName('worktrees')} {tabName('repo')}
       {tab === 'worktrees' && repo && (
         <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
+      )}
+      {tab === 'worktrees' && conflicting > 0 && (
+        <Text color="red"> · {conflicting} worktree{conflicting === 1 ? '' : 's'} would conflict with {repo?.base}</Text>
       )}
       {tab === 'worktrees' && shared > 0 && <Text color="yellow"> · {shared} file{shared === 1 ? '' : 's'} changed in more than one worktree</Text>}
       {tab === 'repo' && files && (
@@ -878,7 +1029,7 @@ const App = ({ root }: { root: string }) => {
   const keys =
     tab === 'repo'
       ? `↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · r refresh · q quit`
-      : '↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · wheel scroll · o nvim · tab repo · r refresh · q quit'
+      : `↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · o nvim · u merge ${repo?.base ?? 'base'} in · U abort · tab repo · r refresh · q quit`
 
   return (
     <Box flexDirection="column" height={size.rows - 1}>
