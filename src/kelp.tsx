@@ -85,6 +85,18 @@ const TOOL_INPUT_LINES = 6
 const TOOL_RESULT_LINES = 8
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
 const LONG_TOOLS = ['Agent', 'Task', 'WebFetch', 'WebSearch']
+// What each agent shows at the bottom of its tmux pane while it asks leave to run something, and while it works,
+// and the keys that answer yes and no; showing neither, it is idle. Claude's work is told from its transcript instead.
+// Only the last PANE_LINES lines of the screen are looked at, so the conversation above can't match.
+const PANE_SIGNS: Record<string, { asking: RegExp; busy: RegExp; yes: string[]; no: string[] }> = {
+  claude: { asking: /^\s*❯ 1\. Yes\b/m, busy: /esc to interrupt/, yes: ['1'], no: ['Escape'] },
+  codex: { asking: /Would you like to (run|make)|Allow command\?|Yes, proceed/, busy: /esc to interrupt/, yes: ['y'], no: ['Escape'] },
+  gemini: { asking: /Allow execution|Apply this change\?|Yes, allow once/, busy: /esc to cancel/, yes: ['Enter'], no: ['Escape'] },
+  aider: { asking: /\(Y\)es\/\(N\)o/, busy: /Waiting for \S|Thinking\.\.\./, yes: ['y', 'Enter'], no: ['n', 'Enter'] },
+  opencode: { asking: /Permission required|Allow once/, busy: /esc interrupt/, yes: ['Enter'], no: ['Right', 'Right', 'Enter'] },
+  'cursor-agent': { asking: /Run this command\?|Skip \(esc or n\)/, busy: /ctrl\+c to stop|esc to interrupt/, yes: ['y'], no: ['Escape'] },
+}
+const PANE_LINES = 15
 // The ports handed to worktrees, one each from a hash of its branch, so it stays the same across restarts.
 const PORT_FROM = 10_000
 const PORT_COUNT = 10_000
@@ -260,10 +272,11 @@ type Tree = {
   isUpstreamGone: boolean
 }
 
-// A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
-// for the person (its turn done, or with `isAsking` asking leave to run a tool), what it last said or asks to run,
-// while busy when its turn began, and else when it went quiet, ms since the epoch. `spend` is what its session has used so far,
-// `session` names its session and `turns` are its conversation's latest entries.
+// A coding agent running in a worktree. For claude from its transcript, for the others from what their tmux pane
+// shows: whether it is busy, whether it waits for the person (its turn done, or with `isAsking` asking leave to run
+// a tool), and when it went quiet, ms since the epoch. For claude only: what it last said or asks to run, while busy
+// when its turn began; `spend` is what its session has used so far, `session` names its session and `turns` are
+// its conversation's latest entries.
 type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number; idleAt?: number; spend?: Spend; session?: string; turns?: Turn[] }
 
 // Tokens a claude used, by kind: its prompts' new input, its output, cache writes (kept 5 minutes or an hour,
@@ -716,7 +729,19 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const busy = trees.flatMap(t => t.agents).filter(a => a.name === 'claude' && a.isBusy)
   await Promise.all(busy.map(async agent => {
     const pane = paneOf(panes, agent.pid)
-    if (pane && (await isAskingIn(pane))) Object.assign(agent, { isBusy: false, isWaiting: true, isAsking: true, turnAt: undefined })
+    if (pane && (await isAskingIn('claude', pane))) Object.assign(agent, { isBusy: false, isWaiting: true, isAsking: true, turnAt: undefined })
+  }))
+  // The other agents have no transcript kelp reads, so each one's pane is read instead, once a refresh: at work,
+  // asking leave, done and so waiting for a while after it was last at work, or else idle.
+  const others = trees.flatMap(t => t.agents).filter(a => a.name !== 'claude')
+  await Promise.all(others.map(async agent => {
+    const pane = paneOf(panes, agent.pid)
+    const state = pane && (await paneState(agent.name, pane))
+    if (!state) return
+    if (state === 'busy') busyAt.set(agent.pid, Date.now())
+    const lastBusy = busyAt.get(agent.pid)
+    const isDone = state === 'idle' && Date.now() - (lastBusy ?? 0) < WAITING_MS
+    Object.assign(agent, { isBusy: state === 'busy', isWaiting: state === 'asking' || isDone, isAsking: state === 'asking', idleAt: state === 'busy' ? undefined : lastBusy })
   }))
   for (const { path, port } of await findListening(trees)) {
     const tree = trees.find(t => t.path === path)!
@@ -1280,19 +1305,39 @@ const typeInto = async (pane: Pane, text: string) => {
   return succeeds(['tmux', 'send-keys', '-t', pane.id, 'Enter'])
 }
 
-// Whether a tmux pane shows claude's menu asking leave to run a tool, its first choice "1. Yes". Claude writes
-// the tool call to its transcript only once it is answered, so the transcript alone can't always tell.
-const isAskingIn = async (pane: Pane) => {
+// The last PANE_LINES lines a tmux pane shows, blank ones left out; '' when it can't be read.
+const readPane = async (pane: Pane) => {
   const run = await runCommand(homedir(), ['tmux', 'capture-pane', '-p', '-t', pane.id])
 
-  return run?.code === 0 && /^\s*❯ 1\. Yes\b/m.test(run.out)
+  return run?.code === 0 ? run.out.split('\n').filter(l => l.trim()).slice(-PANE_LINES).join('\n') : ''
 }
 
-// Answers claude's menu asking leave to run a tool: 1 picks its first choice, "Yes"; esc says no, as the number
-// of "No" changes from one menu to another. Words given with a no are then typed in, as what to do instead. Whether it went.
-const answerAsking = async (pane: Pane, isAllowed: boolean, instead = '') => {
-  if (isAllowed) return succeeds(['tmux', 'send-keys', '-t', pane.id, '1'])
-  if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, 'Escape']))) return false
+// What agent `name`'s tmux pane shows it doing, by PANE_SIGNS: asking leave to run something, at work, or idle;
+// undefined for an agent kelp knows no signs of, or a pane it can't read.
+const paneState = async (name: string, pane: Pane) => {
+  const signs = PANE_SIGNS[name]
+  const text = signs ? await readPane(pane) : ''
+  if (!text) return undefined
+
+  return signs.asking.test(text) ? 'asking' : signs.busy.test(text) ? 'busy' : 'idle'
+}
+
+// Whether a tmux pane shows agent `name` asking leave to run something. Claude writes the tool call to its
+// transcript only once it is answered, so the transcript alone can't always tell.
+const isAskingIn = async (name: string, pane: Pane) => (await paneState(name, pane)) === 'asking'
+
+// When each agent told from its pane, by pid, was last seen at work, so one done since counts as waiting a while.
+const busyAt = new Map<number, number>()
+
+// Answers an agent asking leave to run something with the keys PANE_SIGNS gives for yes or no; claude's 1 picks
+// "Yes", its esc says no, as the number of "No" changes from one menu to another. Words given with a no are then
+// typed in, as what to do instead. Whether it went.
+const answerAsking = async (name: string, pane: Pane, isAllowed: boolean, instead = '') => {
+  const signs = PANE_SIGNS[name] ?? PANE_SIGNS.claude
+  for (const key of isAllowed ? signs.yes : signs.no) {
+    if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, key]))) return false
+  }
+  if (isAllowed) return true
   if (!instead) return true
   await Bun.sleep(500)
 
@@ -3383,13 +3428,13 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     // A line under a file, not the file's own line, which opens and closes.
     const at = row?.file && !row.canOpen && row.file.startsWith(`${tree.path}/`) ? `${row.file.slice(tree.path.length + 1)}:${row.line ?? 1}` : ''
     // Asking leave to run a tool, its menu wants yes or no, not free text; a note goes with a no.
-    if (agent.isAsking || (await isAskingIn(pane))) {
+    if (agent.isAsking || (await isAskingIn('claude', pane))) {
       const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
       return ask(`claude in ${name} asks to run ${asks.length > 50 ? `${asks.slice(0, 49)}…` : asks} · allow? y/n, or n and what to do instead:`, async answer => {
         const no = answer.match(/^no?(?:\s+|$)(.*)$/i)
         if (!/^y(es)?$/i.test(answer) && !no) return setNotice('Nothing sent: answer y or n.')
         const instead = no?.[1] && at ? `${at}: ${no[1]}` : (no?.[1] ?? '')
-        const isSent = await answerAsking(pane, !no, instead)
+        const isSent = await answerAsking('claude', pane, !no, instead)
         setNotice(!isSent ? `Couldn't send keys to tmux pane ${pane.id}.` : no ? `Told claude in ${name} no${instead ? ', and what to do instead' : ''}.` : `Allowed claude in ${name} to run ${asks}.`)
         refresh.current()
       })
