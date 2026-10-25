@@ -20,9 +20,10 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **agents**: the coding agents running in each worktree (claude, codex, aider, gemini, opencode, cursor-agent), found from their processes' folders on Linux. A claude shows `●` green while it is working and `○` dim when idle, told by whether it wrote to its transcript in the last 30 seconds
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run
 - **committing**: `c` asks for a message in the footer and commits everything uncommitted in the worktree under the cursor, untracked files included
+- **discarding**: `D` (twice) on an uncommitted file throws its changes away: a tracked file goes back to its last commit, an untracked one is deleted
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **repo**: a second tab with the file tree of the worktree kelp runs in; open a file to read it, or press `d` to see its diff against HEAD instead. Changed files and the folders holding them are marked
 
-Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `u` merge the base in, `U` abort a merge, `c` commit everything, `r` refresh, `?` list every key, `q` quit.
+Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `u` merge the base in, `U` abort a merge, `c` commit everything, `D` discard a file's changes, `r` refresh, `?` list every key, `q` quit.
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.

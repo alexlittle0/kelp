@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
@@ -86,6 +86,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'git',
     keys: [
       ['c', 'commit everything in the worktree, asking for the message'],
+      ['D', "discard an uncommitted file's changes (twice)"],
     ],
   },
   {
@@ -1387,6 +1388,48 @@ const App = ({ root }: { root: string }) => {
   // The worktree the cursor is in: the one whose line it is on or under, or in the repo tab the one explored.
   const treeUnder = () => repo?.trees.find(t => (tab === 'repo' ? files?.dir === t.path : row?.key.split('\t')[1] === t.path))
 
+  // The uncommitted file the cursor is on or in the diff of: its worktree's folder, its path there, and whether git tracks it.
+  const uncommittedUnder = () => {
+    const at = row && (row.canOpen ? row : parentOf(row))
+    const parts = at?.key.split('\t') ?? []
+    const dir = tab === 'repo' ? files?.dir : treeUnder()?.path
+    // An uncommitted file's line is "tree\t<worktree>\tuncommitted\t<file>" in the worktrees tab, "file\t<file>" in the repo tab.
+    const file = tab === 'repo' ? (parts[0] === 'file' ? parts[1] : undefined) : parts[2] === 'uncommitted' && parts.length === 4 ? parts[3] : undefined
+    const change = treeUnder()?.uncommitted.find(c => c.path === file)
+    const code = tab === 'repo' ? files?.status[file ?? ''] : change && (change.isUntracked ? '??' : 'M')
+    if (!dir || !file || !code) return undefined
+
+    return { dir, file, isUntracked: code === '??' }
+  }
+
+  // Throws away the uncommitted changes of the file under the cursor, on a second press:
+  // a tracked file goes back to its last commit, an untracked one is deleted.
+  const discard = () => {
+    const under = uncommittedUnder()
+    if (tab === 'worktrees' && row?.key.startsWith('tree\t') && row.key.split('\t').length === 2) return setNotice('D discards an uncommitted file; it does nothing to a whole worktree.')
+    if (!under) return setNotice('Put the cursor on an uncommitted file to discard its changes.')
+    const { dir, file, isUntracked } = under
+    // A repository inside this one, such as another worktree, shows as its folder; kelp never deletes those.
+    if (file.endsWith('/')) return setNotice(`${file} is a repository of its own: kelp won't delete it.`)
+
+    confirm('D', isUntracked ? `Delete ${file}, which git does not track` : `Throw away the uncommitted changes to ${file}`, async () => {
+      let isDone = false
+      if (isUntracked) {
+        try {
+          rmSync(`${dir}/${file}`, { force: true })
+          isDone = true
+        } catch {
+          // Left as it was.
+        }
+      } else {
+        isDone = (await gitRun(dir, ['restore', '--source=HEAD', '--staged', '--worktree', '--', `:(literal)${file}`]))?.code === 0
+      }
+      await refresh.current()
+      if (!isDone) return setNotice(`Could not discard ${file}: run git restore in ${shortPath(dir)} to see why.`)
+      setNotice(isUntracked ? `Deleted ${file}.` : `Discarded the changes to ${file}.`)
+    })
+  }
+
   // Asks for a message, then commits everything uncommitted in the worktree under the cursor, untracked files included.
   const commitAll = () => {
     const tree = treeUnder()
@@ -1436,6 +1479,7 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
     else if (input === 'c' && !key.ctrl) commitAll()
+    else if (input === 'D') discard()
     else if (input === 'r') refresh.current()
     else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
     else if (input === '1') switchTab('worktrees')
@@ -1483,12 +1527,13 @@ const App = ({ root }: { root: string }) => {
       {tab === 'repo' && changed > 0 && <Text color="yellow"> · {changed} changed</Text>}
     </Text>
   )
-  // The footer keeps to the keys most wanted here; `?` lists them all.
+  // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
+  const discardKey = uncommittedUnder() ? ' · D discard' : ''
   const keys = isHelp
     ? '? esc close'
     : tab === 'repo'
-      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · o nvim · c commit · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · o nvim · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
