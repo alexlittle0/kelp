@@ -160,7 +160,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'git',
     keys: [
-      ['c', 'commit what is staged, or with nothing staged everything, asking for the message'],
+      ['c', 'commit what is staged, or with nothing staged everything, asking for the message; left empty, amend the last commit when unpushed'],
       ['+ -', 'stage, unstage the uncommitted file (on "uncommitted": all; in its diff: the hunk)'],
       ['z', 'stash the uncommitted changes, untracked included, asking for a message'],
       ['Z', 'pop the stash under the cursor, or the worktree\'s latest (twice)'],
@@ -3248,23 +3248,32 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   }
 
   // Asks for a message, then commits what is staged in the worktree under the cursor, or with nothing staged
-  // everything uncommitted, untracked files included.
+  // everything uncommitted, untracked files included. Left empty, it offers to amend the last commit instead,
+  // when that is the worktree's own, not in the base nor pushed; with nothing uncommitted, only to reword it.
   const commitAll = () => {
     const tree = treeUnder()
     if (!tree) return
     const name = label(tree)
     const n = tree.uncommitted.length
-    if (n === 0) return setNotice(`${name} has nothing to commit.`)
+    const last = tree.commits[0]
+    const canAmend = !tree.isBase && tree.ahead > 0 && last !== undefined && (!tree.upstream || tree.unpushed > 0 || tree.isUpstreamGone)
+    if (n === 0 && !canAmend) return setNotice(`${name} has nothing to commit.`)
     const staged = tree.uncommitted.filter(c => c.stage).length
-    const what = staged > 0 ? `the ${plural(staged, 'staged file')}` : `all ${plural(n, 'file')}`
-    ask(`commit ${what} in ${name}:`, async message => {
-      if (!message) return setNotice('Nothing committed: the message was empty.')
-      setNotice(`Committing in ${name}…`)
-      const added = staged > 0 ? { code: 0 } : await gitRun(tree.path, ['add', '-A'])
-      const run = added?.code === 0 ? await gitRun(tree.path, ['commit', '--quiet', '-m', message]) : null
+    const what = n === 0 ? 'nothing new' : staged > 0 ? `the ${plural(staged, 'staged file')}` : `all ${plural(n, 'file')}`
+    const commit = async (message: string, isAmend: boolean) => {
+      if (!message) return setNotice(`Nothing ${isAmend ? 'amended' : 'committed'}: the message was empty.`)
+      setNotice(`${isAmend ? 'Amending' : 'Committing'} in ${name}…`)
+      const added = staged > 0 || n === 0 ? { code: 0 } : await gitRun(tree.path, ['add', '-A'])
+      const run = added?.code === 0 ? await gitRun(tree.path, ['commit', '--quiet', ...(isAmend ? ['--amend'] : []), '-m', message]) : null
       const hash = (await git(tree.path, ['rev-parse', '--short', 'HEAD']))?.trim()
       await refresh.current()
-      setNotice(run?.code === 0 ? `Committed ${hash} ${message} in ${name}.` : `The commit failed: run git commit in ${shortPath(tree.path)} to see why.`)
+      setNotice(run?.code === 0 ? `${isAmend ? 'Amended' : 'Committed'} ${hash} ${message} in ${name}.` : `The commit failed: run git commit in ${shortPath(tree.path)} to see why.`)
+    }
+    const amend = () => ask(`amend ${last!.hash} with ${what}, message:`, message => commit(message, true), last!.subject)
+    if (n === 0) return amend()
+    ask(`commit ${what} in ${name}${canAmend ? ` (empty: amend ${last!.hash})` : ''}:`, message => {
+      if (!message && canAmend) return amend()
+      commit(message, false)
     })
   }
 
