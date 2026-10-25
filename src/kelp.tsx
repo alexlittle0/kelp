@@ -1612,8 +1612,8 @@ const buildRows = (
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind` })
-    // Fully in the base: safe to remove.
-    if (tree.isMerged) parts.push({ text: 'merged' })
+    // Fully in the base and nothing uncommitted: safe to remove.
+    if (tree.isMerged && tree.uncommitted.length === 0) parts.push({ text: 'merged' })
     // Where it stands against its remote branch; nothing when the repository has no remote.
     if (!tree.isUpstreamGone) {
       if (tree.unpushed > 0 || tree.unpulled > 0) {
