@@ -281,7 +281,9 @@ type Files = { dir: string; files: string[]; isCut: boolean; status: Record<stri
 // its markers named for the worktree and the base.
 type Conflict = { merged: string; ours: string; theirs: string }
 // A diff to show under an open file, or with `isWhole` the file itself, or with `conflict` its conflicts, and where it comes from.
-type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean; conflict?: Conflict }
+// `side` picks, of an uncommitted file's changes, only the staged ones or only those not staged.
+type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean; conflict?: Conflict; side?: Side }
+type Side = 'staged' | 'unstaged'
 // `isUnreadable` when a whole file is binary, too large or missing; `colors` when the lines carry their own,
 // else they are coloured as a diff. `tokens` are each line's code highlighted, when its language is known,
 // and `numbers` the line of the file each one is, for a conflict's lines.
@@ -738,14 +740,14 @@ const readConflict = async (want: Wanted, conflict: Conflict) => {
   return { lines: cut(lines), colors: cut(colors), tokens: cut(tokens), numbers: cut(numbers), isCut: lines.length > MAX_DIFF_LINES }
 }
 
-// A file's diff from its first hunk on, against HEAD when uncommitted or within its commit.
+// A file's diff from its first hunk on, against HEAD when uncommitted (or of one `side`) or within its commit.
 const readDiff = async (want: Wanted): Promise<Omit<Diff, 'version'>> => {
   if (want.conflict) return readConflict(want, want.conflict)
   const text = want.commit
     ? await git(want.tree, ['show', '--format=', '--no-renames', '--diff-merges=first-parent', want.commit, '--', want.file])
     : want.isUntracked
       ? await git(want.tree, ['diff', '--no-index', '--', '/dev/null', want.file], [0, 1])
-      : await git(want.tree, ['diff', 'HEAD', '--no-renames', '--', want.file])
+      : await git(want.tree, ['diff', ...(want.side === 'staged' ? ['--cached'] : want.side === 'unstaged' ? [] : ['HEAD']), '--no-renames', '--', want.file])
   const lines = (text ?? '').replace(/\n$/, '').split('\n')
   const from = lines.findIndex(l => l.startsWith('@@'))
   // Each line's code cleaned after its sign, so tab stops line up with the code.
@@ -2000,6 +2002,28 @@ const buildRows = (
     const isStopped = tree.isMerging || tree.isRebasing
     const sides = tree.isRebasing ? { ours: repo.base, theirs: label(tree) } : { ours: label(tree), theirs: repo.base }
     const conflict = isConflict ? { merged: isStopped ? '' : tree.merged, ...sides } : undefined
+    // A partly staged file shows its staged changes and the rest apart, each under its own heading.
+    if (change.stage === 'partly' && !commit) {
+      for (const side of ['staged', 'unstaged'] as Side[]) {
+        const sub = `${key}\t${side}`
+        const isSubOpen = isOpen(sub, true)
+        rows.push({
+          key: sub,
+          parent: key,
+          depth: 3,
+          canOpen: true,
+          isOpenByDefault: true,
+          node: <Text dimColor wrap="truncate-end">{isSubOpen ? '▾' : '▸'} {side}</Text>,
+        })
+        if (!isSubOpen) continue
+        wanted.push({ key: sub, tree: tree.path, file: change.path, side })
+        const diff = diffs.get(sub)
+        if (!diff) note(`${sub}\tloading`, sub, 4, 'Loading…')
+        else rows.push(...diffRows(sub, file, diff, 4))
+        if (diff?.isCut) note(`${sub}\tcut`, sub, 4, `… diff cut at ${MAX_DIFF_LINES} lines`)
+      }
+      return
+    }
     wanted.push({ key, tree: tree.path, file: change.path, commit, isUntracked: change.isUntracked, conflict })
     const diff = diffs.get(key)
     if (!diff) return note(`${key}\tloading`, key, 3, 'Loading…')
@@ -3118,7 +3142,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const parts = at?.key.split('\t') ?? []
     const dir = tab === 'repo' ? files?.dir : treeUnder()?.path
     // An uncommitted file's line is "tree\t<worktree>\tuncommitted\t<file>" in the worktrees tab, "file\t<file>" in the repo tab.
-    const file = tab === 'repo' ? (parts[0] === 'file' ? parts[1] : undefined) : parts[2] === 'uncommitted' && parts.length === 4 ? parts[3] : undefined
+    // A partly staged file's "staged" and "unstaged" headings sit under it, one more part on its key.
+    const isFile = parts.length === 4 || (parts.length === 5 && (parts[4] === 'staged' || parts[4] === 'unstaged'))
+    const file = tab === 'repo' ? (parts[0] === 'file' ? parts[1] : undefined) : parts[2] === 'uncommitted' && isFile ? parts[3] : undefined
     const change = treeUnder()?.uncommitted.find(c => c.path === file)
     const code = tab === 'repo' ? files?.status[file ?? ''] : change && (change.isUntracked ? '??' : 'M')
     if (!dir || !file || !code) return undefined
@@ -3176,14 +3202,16 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   }
 
   // The hunk the cursor is in, on a line of an uncommitted file's diff: the file's folder and path, the hunk's lines,
-  // and whether the diff shown is of staged changes. Only for a changed file git tracks; a new, deleted
-  // or binary one is staged whole.
+  // and whether the diff shown is of staged changes, from the heading it is under when the file is partly staged.
+  // Only for a changed file git tracks; a new, deleted or binary one is staged whole.
   const hunkUnder = () => {
     const tree = treeUnder()
     const parent = row?.parent
     const at = Number(row?.key.split('\t').pop())
     const parts = parent?.split('\t') ?? []
-    if (tab !== 'worktrees' || !tree || !parent || parts[2] !== 'uncommitted' || parts.length !== 4 || !Number.isInteger(at)) return undefined
+    const side = parts[4] as Side | undefined
+    if (tab !== 'worktrees' || !tree || !parent || parts[2] !== 'uncommitted' || !Number.isInteger(at)) return undefined
+    if (parts.length !== 4 && !(parts.length === 5 && (side === 'staged' || side === 'unstaged'))) return undefined
     const change = tree.uncommitted.find(c => c.path === parts[3])
     const diff = diffs.get(parent)
     if (!change || change.tag !== '' || change.isUntracked || !diff) return undefined
@@ -3192,14 +3220,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const end = next === -1 ? diff.lines.length : next
     if (start === -1) return undefined
 
-    return { dir: tree.path, file: change.path, change, lines: diff.lines.slice(start, end), isCut: diff.isCut && next === -1, isStaged: change.stage === 'staged' }
+    return { dir: tree.path, file: change.path, change, lines: diff.lines.slice(start, end), isCut: diff.isCut && next === -1, isStaged: side ? side === 'staged' : change.stage === 'staged', isSplit: side !== undefined }
   }
 
   // Stages (+) or unstages (-) the hunk under the cursor in a file's diff by applying it to the index, as a patch.
   const stageHunk = async (hunk: NonNullable<ReturnType<typeof hunkUnder>>, isStage: boolean) => {
     const { dir, file } = hunk
     if (hunk.isCut) return setNotice(`The diff of ${file} is cut short there: stage the whole file with ${isStage ? '+' : '-'} on its line.`)
-    if (hunk.change.stage === 'partly') return setNotice(`${file} is partly staged: stage or unstage it whole on its line.`)
+    if (hunk.change.stage === 'partly' && !hunk.isSplit) return setNotice(`${file} is partly staged: stage or unstage it whole on its line.`)
     if (isStage === hunk.isStaged) return setNotice(`That hunk of ${file} is already ${isStage ? 'staged' : 'unstaged'}.`)
     const patch = `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${hunk.lines.join('\n')}\n`
     const failed = await applyToIndex(dir, patch, !isStage)
