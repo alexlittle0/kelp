@@ -66,6 +66,8 @@ const WAITING_MS = 60 * 60_000
 // A claude whose transcript ends on a prompt or a tool's result is waiting on its model, quietly while it thinks;
 // past this long something went wrong, and it counts as idle.
 const THINKING_MS = 10 * 60_000
+// Attempts `N` makes at once at most, with a branch such as fix-login*3.
+const MAX_ATTEMPTS = 9
 // How soon a second `A` must follow the first to go on to the worktree's tmux pane.
 const AGAIN_MS = 2000
 // How much of the end of a claude transcript is read.
@@ -131,7 +133,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['t', 'jump to the worktree: its tmux pane, else a new window there'],
       ['a', 'start claude in the worktree, in a new window'],
-      ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt'],
+      ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
       ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
     ],
@@ -3077,16 +3079,27 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   }
 
   // N: asks for a branch, then for what claude should do there; makes the worktree as `n` does,
-  // then starts claude in it with that prompt, once the worktree is readied.
+  // then starts claude in it with that prompt, once the worktree is readied. A branch ending in *3, such as
+  // fix-login*3, makes several attempts at once: fix-login-1 to fix-login-3, each with claude on the same prompt.
   const newTask = () =>
-    ask('new task on branch', branch => {
-      if (!branch) return
-      ask(`task for claude in ${branch}:`, async task => {
+    ask('new task on branch (name*3 for 3 attempts)', answer => {
+      if (!answer) return
+      const many = answer.match(/^(.+)\*(\d+)$/)
+      const count = many ? Number(many[2]) : 1
+      if (count < 1 || count > MAX_ATTEMPTS) return setNotice(`Between 1 and ${MAX_ATTEMPTS} attempts at once.`)
+      const branches = many ? Array.from({ length: count }, (_, k) => `${many[1]}-${k + 1}`) : [answer]
+      ask(`task for claude in ${many ? `${branches[0]} to ${branches.at(-1)}` : answer}:`, async task => {
         if (!task) return setNotice('No task started: the prompt was empty.')
-        const path = await createTree(branch)
-        if (!path) return
-        setNotice(await startClaude(path, branch, task))
+        const started: string[] = []
+        for (const branch of branches) {
+          const path = await createTree(branch)
+          if (!path) continue
+          const said = await startClaude(path, branch, task)
+          if (!said.startsWith('Started')) return setNotice(said)
+          started.push(branch)
+        }
         refresh.current()
+        if (started.length > 0) setNotice(started.length === 1 ? `Started claude in ${started[0]} on the task.` : `Started claude in ${started.join(', ')} on the same task.`)
       })
     })
 
