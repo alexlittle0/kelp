@@ -68,6 +68,9 @@ const AGAIN_MS = 2000
 const TRANSCRIPT_TAIL = 256 * 1024
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
 const LONG_TOOLS = ['Agent', 'Task', 'WebFetch', 'WebSearch']
+// The ports handed to worktrees, one each from a hash of its branch, so it stays the same across restarts.
+const PORT_FROM = 10_000
+const PORT_COUNT = 10_000
 
 // Every key, grouped by area, as `?` lists them. Add a line here for any new key.
 const KEYS: { area: string; keys: [string, string][] }[] = [
@@ -1001,9 +1004,9 @@ const startClaude = async (path: string, branch: string, prompt = '') => {
 
 // A command's output, error output and exit code, or null when it cannot be started, such as gh not being installed.
 // It never asks for a password or passphrase, which would hang with nobody to answer.
-const runCommand = async (cwd: string, args: string[]) => {
+const runCommand = async (cwd: string, args: string[], more: Record<string, string> = {}) => {
   try {
-    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes' }
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes', ...more }
     const proc = Bun.spawn(args, { cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
 
@@ -1137,16 +1140,28 @@ const findUrl = (line: string) => {
 
 const isRunning = (run?: Run) => run !== undefined && run.endedAt === undefined
 
-// Runs `command` with sh in the worktree at `tree`, in a process group of its own so stopping it stops all it started.
-// `onChange` is called as output comes and when it ends. Throws when it cannot start.
-const startRun = (tree: string, command: string, onChange: () => void) => {
+// The port a worktree's dev server should listen on, from a hash of its branch (its folder when detached);
+// none for the base branch's worktree, which keeps the app's own default.
+const portOf = (tree: { path: string; branch: string; isBase: boolean }) =>
+  tree.isBase ? undefined : PORT_FROM + Number(BigInt(Bun.hash(tree.branch || tree.path)) % BigInt(PORT_COUNT))
+
+// What kelp tells every command it runs in a worktree: its port as PORT and KELP_PORT, its branch, its folder and the base branch.
+const kelpEnv = (tree: { path: string; branch: string; isBase: boolean }, base: string): Record<string, string> => {
+  const port = portOf(tree)
+
+  return { ...(port ? { PORT: String(port), KELP_PORT: String(port) } : {}), KELP_BRANCH: tree.branch, KELP_WORKTREE: tree.path, KELP_BASE: base }
+}
+
+// Runs `command` with sh in the worktree at `tree`, in a process group of its own so stopping it stops all it started,
+// with `env` added to kelp's own. `onChange` is called as output comes and when it ends. Throws when it cannot start.
+const startRun = (tree: string, command: string, env: Record<string, string>, onChange: () => void) => {
   const proc = Bun.spawn(['sh', '-c', command], {
     cwd: tree,
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
     detached: true,
-    env: { ...process.env, NO_COLOR: '1' },
+    env: { ...process.env, NO_COLOR: '1', ...env },
   })
   const run: Run = { tree, command, startedAt: Date.now(), lines: [], pid: proc.pid }
   runs.set(tree, run)
@@ -1605,6 +1620,9 @@ const buildRows = (
       if (isRunning(run) || run.code !== 0) parts.push({ text: `${state.mark} ${what}`, color: state.color })
       if (isRunning(run) && run.url) details.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
+    // The port kelp hands its commands as $PORT.
+    const port = portOf(tree)
+    if (port) details.push({ text: `port ${port}` })
     // Its agents: one waiting for the person and a busy one on the line, the idle ones in the details.
     const waiting = tree.agents.filter(a => a.isWaiting)
     const busy = tree.agents.filter(a => a.isBusy !== false && !a.isWaiting)
@@ -2479,7 +2497,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     }
     for (const command of config.postCreate) {
       setJob(path, { text: `Running ${command}…` })
-      const run = await runCommand(path, ['sh', '-c', command])
+      const run = await runCommand(path, ['sh', '-c', command], kelpEnv({ path, branch, isBase: false }, repo.base))
       if (run?.code !== 0) {
         const why = run ? `exit ${run.code}: ${whyFailed(run.err || run.out)}` : "couldn't start"
         setJob(path, { text: `${command} failed (${why})`, isFailed: true })
@@ -2725,8 +2743,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const runIn = (tree: string, command: string) => {
     const running = runs.get(tree)
     if (isRunning(running)) return setNotice(`${treeName(tree)} still runs ${running!.command}; K twice stops it`)
+    const at = repo && treeAt(repo.trees, tree)
     try {
-      startRun(tree, command, drawRunsSoon)
+      startRun(tree, command, at ? kelpEnv(at, repo.base) : {}, drawRunsSoon)
     } catch {
       return setNotice(`Couldn't run ${command} in ${shortPath(tree)}`)
     }
