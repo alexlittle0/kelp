@@ -103,6 +103,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['!', 'run a shell command in the worktree'],
       [':', 'run one of its commands: .kelp.json or package.json'],
+      ['K', 'stop the command running in the worktree (twice), or clear one that ended'],
     ],
   },
   {
@@ -1122,6 +1123,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       const state = runState(run)
       const what = run.command.length > 16 ? `${run.command.slice(0, 15)}…` : run.command
       parts.push({ text: `${state.mark} ${what}${isRunning(run) ? ` ${duration(Date.now() - run.startedAt)}` : ''}`, color: state.color })
+      if (isRunning(run) && run.url) parts.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
     // Its agents, alike ones counted together: a busy claude green, an idle one dim, the rest cyan.
     const kinds = new Map<string, { agent: Agent; count: number }>()
@@ -1864,6 +1866,20 @@ const App = ({ root }: { root: string }) => {
       if (!tree) return setNotice('Move to a worktree to run a command in it')
       ask(`run in ${treeName(tree)}:`, command => command && runIn(tree, command), runs.get(tree)?.command)
     }
+    else if (input === 'K') {
+      // Stops the worktree's command, pressed twice; one that has ended goes from view at once.
+      const tree = treeAtCursor()
+      const run = tree ? runs.get(tree) : undefined
+      if (!tree || !run) return setNotice('No command run here')
+      if (!isRunning(run)) {
+        runs.delete(tree)
+        return redraw(n => n + 1)
+      }
+      confirm('K', `Stop ${run.command} in ${treeName(tree)}, and everything it started`, () => {
+        stopRun(run)
+        setNotice(`Stopping ${run.command}…`)
+      })
+    }
     else if (input === ':') {
       // Names one of the worktree's commands; the start of a name, or any part of it, will do.
       const tree = treeAtCursor()
@@ -1931,7 +1947,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! : run · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! : run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
