@@ -78,7 +78,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `/` filter, `esc` clear it
 - `s` order the worktrees by name, recent activity, or needing attention first (conflicts, a busy agent, uncommitted changes)
 - `r` refresh
-- `?` list every key
+- `?` list every key, `j`/`k` scroll the list when it is longer than the screen, `esc` or `?` close it
 - `q` quit
 
 ### Switching worktrees with `w`

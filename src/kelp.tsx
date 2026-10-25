@@ -181,7 +181,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'kelp',
     keys: [
       ['r', 'refresh now'],
-      ['?', 'these keys'],
+      ['?', 'these keys; j k scroll them, esc or ? closes'],
       ['q', 'quit'],
     ],
   },
@@ -2432,6 +2432,38 @@ const planSync = (repo: Repo) => {
   return { syncs, skipped }
 }
 
+// ---- Help ----
+
+// Columns apart in the `?` list.
+const HELP_GAP = 4
+
+// A line of the `?` list in each of its columns: an area's name, a key and what it does, or nothing.
+type HelpCell = string | [string, string] | undefined
+
+// The `?` list laid out in `columns`: the areas run down as many columns as fit side by side, as evenly as they go,
+// a blank line after each. `width` is each column's, `keyWidth` the widest key's, so descriptions line up.
+const layoutHelp = (columns: number) => {
+  const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
+  const widest = Math.max(...KEYS.flatMap(a => a.keys.map(([, what]) => keyWidth + 2 + what.length)))
+  const count = Math.max(1, Math.min(KEYS.length, Math.floor((columns + HELP_GAP) / (widest + HELP_GAP))))
+  const width = Math.floor((columns + HELP_GAP) / count) - HELP_GAP
+  const areas: HelpCell[][] = KEYS.map(a => [a.area, ...a.keys, undefined])
+  // The shortest columns the areas fit in, taken in order.
+  const total = areas.reduce((n, a) => n + a.length, 0)
+  let stacks: HelpCell[][] = []
+  for (let most = Math.ceil(total / count); stacks.length === 0 || stacks.length > count; most++) {
+    stacks = [[]]
+    for (const area of areas) {
+      if (stacks.at(-1)!.length > 0 && stacks.at(-1)!.length + area.length > most) stacks.push([])
+      stacks.at(-1)!.push(...area)
+    }
+  }
+  const length = Math.max(...stacks.map(s => s.length)) - 1
+  const lines = Array.from({ length }, (_, n) => stacks.map(s => s[n]))
+
+  return { lines, width, keyWidth }
+}
+
 // ---- Saved state ----
 
 // Where kelp remembers the repository holding `root`: ~/.cache/kelp/<hash>.json, the hash of git's own folder,
@@ -2511,6 +2543,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const [armed, setArmed] = useState<Armed | null>(null)
   // Whether `?`'s list of keys covers the rows.
   const [isHelp, setIsHelp] = useState(false)
+  // How far the list of keys is scrolled, when it is longer than the screen.
+  const [helpTop, setHelpTop] = useState(0)
   // Each tab's `/` filter, '' for none.
   const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '', ...saved.filters })
   // Each tab keeps its own cursor and scroll.
@@ -2718,6 +2752,12 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     refresh.current()
   }
 
+  // The `?` list of keys in lines, cut to the screen's height when longer, its last line then saying so.
+  const { lines: helpLines, width: helpWidth, keyWidth } = layoutHelp(columns)
+  const helpRoom = helpLines.length > height ? height - 1 : height
+  const shownHelpTop = Math.max(0, Math.min(helpTop, helpLines.length - helpRoom))
+  const scrollHelp = (lines: number) => setHelpTop(t => Math.max(0, Math.min(helpLines.length - helpRoom, Math.min(t, shownHelpTop) + lines)))
+
   // Scrolls the view by `lines`, bringing the cursor along when it would fall off the screen.
   const scroll = (lines: number) => {
     const to = Math.max(0, Math.min(rows.length - height, top + lines))
@@ -2733,8 +2773,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const onMouse = (button: number, column: number, line: number) => {
     // Shift, alt and ctrl only add to the button's number.
     const base = button & ~(4 | 8 | 16)
-    if (base === 64) return scroll(-WHEEL_LINES)
-    if (base === 65) return scroll(WHEEL_LINES)
+    if (base === 64) return isHelp ? scrollHelp(-WHEEL_LINES) : scroll(-WHEEL_LINES)
+    if (base === 65) return isHelp ? scrollHelp(WHEEL_LINES) : scroll(WHEEL_LINES)
+    if (isHelp) return
     if (base !== 0) return
     const tabHit = line === 1 ? TABS.find(t => column >= tabColumns(t)[0] && column <= tabColumns(t)[1]) : undefined
     if (tabHit) return switchTab(tabHit)
@@ -3311,8 +3352,17 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (armed && input !== armed.input) setArmed(null)
     if (isHelp) {
       if (input === '?' || input === 'q' || key.escape) setIsHelp(false)
+      else if (key.upArrow || input === 'k') scrollHelp(-1)
+      else if (key.downArrow || input === 'j') scrollHelp(1)
+      else if (key.pageUp || (key.ctrl && input === 'u')) scrollHelp(-helpRoom)
+      else if (key.pageDown || (key.ctrl && input === 'd')) scrollHelp(helpRoom)
+      else if (input === 'g') scrollHelp(-helpLines.length)
+      else if (input === 'G') scrollHelp(helpLines.length)
     }
-    else if (input === '?') setIsHelp(true)
+    else if (input === '?') {
+      setIsHelp(true)
+      setHelpTop(0)
+    }
     else if (input === 's' && tab === 'worktrees') setSort(SORTS[(SORTS.indexOf(sort) + 1) % SORTS.length])
     else if (input === '/') {
       // Narrows the tab as the filter is typed; ⏎ keeps it, esc drops it.
@@ -3450,24 +3500,28 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // Answering is offered where a claude waits for the person.
   const replyKey = treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting) ? ' · > reply' : ''
   const keys = isHelp
-    ? '? esc close'
+    ? `? esc close${helpLines.length > height ? ' · j k scroll' : ''}`
     : tab === 'repo'
       ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
       : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
-  // The width of the widest key, so every area's descriptions line up.
-  const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
-    <Box flexDirection="row" flexWrap="wrap">
-      {KEYS.map(a => (
-        <Box key={a.area} flexDirection="column" marginRight={4} marginBottom={1}>
-          <Text bold>{a.area}</Text>
-          {a.keys.map(([k, what]) => (
-            <Text key={k} wrap="truncate-end">
-              <Text color="blue">{k.padEnd(keyWidth)}</Text>  <Text dimColor>{what}</Text>
-            </Text>
+    <Box flexDirection="column">
+      {helpLines.slice(shownHelpTop, shownHelpTop + helpRoom).map((cells, n) => (
+        <Box key={n} flexWrap="nowrap">
+          {cells.map((cell, k) => (
+            <Box key={k} width={helpWidth} marginRight={k < cells.length - 1 ? HELP_GAP : 0}>
+              <Text wrap="truncate-end">
+                {typeof cell === 'string' ? <Text bold>{cell}</Text> : cell ? <><Text color="blue">{cell[0].padEnd(keyWidth)}</Text>  <Text dimColor>{cell[1]}</Text></> : ' '}
+              </Text>
+            </Box>
           ))}
         </Box>
       ))}
+      {helpLines.length > height && (
+        <Text dimColor wrap="truncate-end">
+          … lines {shownHelpTop + 1}–{Math.min(helpLines.length, shownHelpTop + helpRoom)} of {helpLines.length} · j k scroll
+        </Text>
+      )}
     </Box>
   )
 
