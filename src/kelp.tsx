@@ -1605,6 +1605,10 @@ const buildRows = (
     if (waiting.length > 0) parts.push({ text: `◆ ${names(waiting)} waiting`, color: 'yellow' })
     if (busy.length > 0) parts.push({ text: `● ${names(busy)}`, color: 'green' })
     if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
+    // What each agent not at work last said, or asks to run, so it can be read without going there.
+    for (const agent of tree.agents.filter(a => a.says && !a.isBusy)) {
+      details.push({ text: agent.says!.length > 60 ? `${agent.says!.slice(0, 59)}…` : agent.says! })
+    }
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind` })
