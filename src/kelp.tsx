@@ -133,11 +133,11 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'agents',
     keys: [
-      ['t', 'jump to the worktree: its tmux pane, else a new window there'],
+      ['t', "jump to the worktree: its tmux pane, else a new window there; in the agents tab, the agent's own pane"],
       ['a', 'start claude in the worktree, in a new window'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
+      ['>', "reply: type a message into the worktree's claude (in the agents tab, the one under the cursor), in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
     ],
   },
   {
@@ -1783,6 +1783,21 @@ const runState = (run: Run) => {
   return { mark: '✗', color: 'red', text: `${run.code === null ? 'stopped' : `exit ${run.code}`} · ${took}` }
 }
 
+// A text cut into lines of at most `width` columns, at spaces where it can.
+const wrapText = (text: string, width: number) => {
+  const lines: string[] = []
+  let rest = text.trim()
+  while (rest.length > width) {
+    const space = rest.lastIndexOf(' ', width)
+    const at = space > 0 ? space : width
+    lines.push(rest.slice(0, at))
+    rest = rest.slice(at).trimStart()
+  }
+  if (rest) lines.push(rest)
+
+  return lines
+}
+
 const clockTime = (at: number) => {
   const d = new Date(at)
 
@@ -2582,9 +2597,11 @@ const AGENT_LOOKS: Record<AgentState, { mark: string; color?: string }> = { wait
 
 // The agents tab's lines: every agent running in any worktree, those waiting for the person first, then those at work,
 // then the idle ones, each with its worktree's branch, how long it has been on its turn or idle, and the start of
-// what it last said. With a `query`, only the agents whose name, branch or words match it.
-const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, query: string) => {
+// what it last said. Opened, its worktree's folder, its tmux pane, and all it last said or asks.
+// With a `query`, only the agents whose name, branch or words match it.
+const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, columns: number, query: string) => {
   const rows: Row[] = []
+  const panes = repo.trees.flatMap(t => t.panes)
   const note = (key: string, parent: string, depth: number, text: string) =>
     rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
   const all = repo.trees
@@ -2617,6 +2634,16 @@ const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) =>
         </Text>
       ),
     })
+    if (!open) continue
+
+    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${tree.isBase ? ' · base' : ''} · pid ${agent.pid}`)
+    const pane = paneOf(panes, agent.pid)
+    const where = pane
+      ? `tmux ${pane.id} · window ${pane.window} (${pane.windowName}) · ${pane.command}`
+      : process.env.TMUX ? 'in no tmux pane kelp can see' : 'kelp is not in tmux, so it sees no panes'
+    note(`${key}\tpane`, key, 1, where)
+    const says = agent.says ? wrapText(agent.isAsking ? `asks: ${agent.says}` : agent.says, columns - 2) : []
+    says.forEach((line, n) => rows.push({ key: `${key}\tsays\t${n}`, parent: key, depth: 1, node: <Text wrap="truncate-end">{line}</Text> }))
   }
   if (all.length === 0) {
     note('none', '', 0, query ? `No agent matches "${query}".` : 'No agents running: N starts claude on a new task, a on a worktree starts one there.')
@@ -2996,7 +3023,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     tab === 'repo'
       ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
       : tab === 'agents'
-        ? (repo ? buildAgentRows(repo, isOpen, filters.agents) : empty)
+        ? (repo ? buildAgentRows(repo, isOpen, columns, filters.agents) : empty)
         : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
@@ -3117,7 +3144,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
     const name = label(tree)
     const claudes = tree.agents.filter(a => a.name === 'claude')
-    const agent = claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
+    const under = agentUnder()
+    const agent = (under?.name === 'claude' ? under : undefined) ?? claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
     if (!agent) return setNotice(`No claude runs in ${name}, so there is nothing to send to: a starts one.`)
     if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to claude in ${name} through.`)
     const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
@@ -3143,6 +3171,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       setNotice(isSent ? `Sent to claude in ${name}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
       refresh.current()
     })
+  }
+
+  // The agent under the cursor in the agents tab, its line or one of its opened lines, keyed "agent\t<worktree>\t<pid>".
+  const agentUnder = () => {
+    const [kind, path, pid] = row?.key.split('\t') ?? []
+    if (tab !== 'agents' || kind !== 'agent') return undefined
+
+    return repo?.trees.find(t => t.path === path)?.agents.find(a => a.pid === Number(pid))
   }
 
   // The worktree under the cursor, or in the repo tab the one it explores.
@@ -3758,7 +3794,10 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === '>') reply()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
-      if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree.path, label(tree))).then(text => {
+      // In the agents tab, t goes to the agent's own pane.
+      const agent = agentUnder()
+      const pane = agent && repo ? paneOf(repo.trees.flatMap(t => t.panes), agent.pid) : undefined
+      if (tree) (input === 't' ? jumpTo(tree, pane ?? tree.panes[0]) : startClaude(tree.path, label(tree))).then(text => {
         setNotice(text)
         refresh.current()
       })
@@ -3878,7 +3917,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
   // Answering is offered where a claude waits for the person.
-  const replyKey = treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting) ? ' · > reply' : ''
+  const replyKey = (tab === 'agents' ? agentUnder()?.name === 'claude' : treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting)) ? ' · > reply' : ''
   const keys = isHelp
     ? `? esc close${helpLines.length > height ? ' · j k scroll' : ''}`
     : tab === 'repo'
