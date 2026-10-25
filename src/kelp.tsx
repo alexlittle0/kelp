@@ -12,8 +12,14 @@ const MAX_DIFF_LINES = 400
 const BASE_COMMITS = 5
 // Commits listed for any other worktree, from where it left the base branch.
 const MAX_COMMITS = 50
-// Untracked files over this size are not read for their line count.
-const MAX_UNTRACKED = 1_000_000
+// Files over this size are not read: not for an untracked file's line count, nor to show in the repo tab.
+const MAX_FILE = 1_000_000
+// Lines of a file the repo tab shows before cutting it.
+const MAX_FILE_LINES = 2000
+// Files the repo tab lists at most.
+const MAX_REPO_FILES = 20_000
+// How long a message, such as where a file was opened, stays in the footer.
+const NOTICE_MS = 4000
 // Lines the view moves per turn of the mouse wheel.
 const WHEEL_LINES = 3
 
@@ -40,13 +46,30 @@ type Tree = {
 
 type Repo = { dir: string; base: string; trees: Tree[] }
 
-// A diff to show under an open file, and where it comes from.
-type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean }
-type Diff = { lines: string[]; isCut: boolean; version: number }
+// The files of the worktree the repo tab explores, relative to its folder, and git's status code for each changed one.
+type Files = { dir: string; files: string[]; isCut: boolean; status: Record<string, string> }
+
+// A diff to show under an open file, or with `isWhole` the file itself, and where it comes from.
+type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean }
+// `isUnreadable` when a whole file is binary, too large or missing.
+type Diff = { lines: string[]; isCut: boolean; isUnreadable?: boolean; version: number }
+
+type Tab = 'worktrees' | 'repo'
 
 // One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
-// `isGap` a blank line between worktrees that the cursor passes over.
-type Row = { key: string; parent?: string; depth: number; canOpen?: boolean; isGap?: boolean; node: JSX.Element }
+// `isOpenByDefault` whether it starts open, `isGap` a blank line between worktrees that the cursor passes over,
+// `file` and `line` where `o` opens it in nvim.
+type Row = {
+  key: string
+  parent?: string
+  depth: number
+  canOpen?: boolean
+  isOpenByDefault?: boolean
+  isGap?: boolean
+  file?: string
+  line?: number
+  node: JSX.Element
+}
 
 // ---- Git ----
 
@@ -120,17 +143,26 @@ const parseLog = (text: string): Commit[] =>
       return { hash, at: Number(time) * 1000, subject, files }
     })
 
-// A text file's line count, or null when it is binary, too large or unreadable.
-const countLines = (file: string) => {
+// A text file's text, or null when it is binary, too large or unreadable.
+const readText = (file: string) => {
   try {
-    if (statSync(file).size > MAX_UNTRACKED) return null
+    if (statSync(file).size > MAX_FILE) return null
     const text = readFileSync(file, 'utf8')
-    if (text.includes('\0')) return null
 
-    return text === '' ? 0 : text.replace(/\n$/, '').split('\n').length
+    return text.includes('\0') ? null : text
   } catch {
     return null
   }
+}
+
+// A text's lines; a final newline ends the last line rather than starting another.
+const toLines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
+
+// A text file's line count, or null when it is binary, too large or unreadable.
+const countLines = (file: string) => {
+  const text = readText(file)
+
+  return text === null ? null : toLines(text).length
 }
 
 const modifiedAt = (file: string) => {
@@ -222,6 +254,80 @@ const readDiff = async (want: Wanted) => {
   return { lines: body.slice(0, MAX_DIFF_LINES), isCut: body.length > MAX_DIFF_LINES }
 }
 
+// What to show under an open file: its diff, or the file itself.
+const readView = async (want: Wanted) => {
+  if (!want.isWhole) return readDiff(want)
+  const text = readText(`${want.tree}/${want.file}`)
+  if (text === null) return { lines: [], isCut: false, isUnreadable: true }
+  const lines = toLines(text)
+
+  return { lines: lines.slice(0, MAX_FILE_LINES), isCut: lines.length > MAX_FILE_LINES }
+}
+
+// The files of the worktree holding `root`, or failing that of the repository `findRepo` finds:
+// git's own list, ignored files left out, and what git reports as changed.
+const loadFiles = async (root: string): Promise<Files | null> => {
+  const dir = (await git(root, ['rev-parse', '--show-toplevel']))?.trim() || (await findRepo(root))
+  if (!dir) return null
+  const [listing, status] = await Promise.all([
+    git(dir, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']),
+    git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames']),
+  ])
+  if (listing === null) return null
+  // A repository nested inside, such as another worktree, is listed as its folder with a trailing slash.
+  const all = [...new Set(listing.split('\0').filter(f => f && !f.endsWith('/')))].sort()
+  const changes: Record<string, string> = {}
+  for (const entry of (status ?? '').split('\0')) {
+    if (entry.length >= 4 && !entry.endsWith('/')) changes[entry.slice(3)] = entry.slice(0, 2)
+  }
+
+  return { dir, files: all.slice(0, MAX_REPO_FILES), isCut: all.length > MAX_REPO_FILES, status: changes }
+}
+
+// Opens `$1` at line `$2` in the running nvim whose folder holds it most closely, bringing its tmux pane forward;
+// with none, in a new tmux pane, else a new kitty window. Prints where.
+const OPEN_IN_NVIM = `
+f="$1"; line="\${2:-1}"; run="\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; best=""; bestlen=-1
+for s in "$run"/nvim.*.0; do
+  [ -S "$s" ] || continue
+  pid=\${s##*/nvim.}; pid=\${pid%.0}
+  cwd=$(readlink "/proc/$pid/cwd") || continue
+  case "$f" in "$cwd"/*) len=\${#cwd} ;; *) len=0 ;; esac
+  if [ "$len" -gt "$bestlen" ]; then best=$s; bestpid=$pid; bestlen=$len; fi
+done
+if [ -n "$best" ]; then
+  # :edit, not --remote, which adds the file to the argument list and makes :q say "E173: 1 more file to edit".
+  quoted=$(printf '%s' "$f" | sed "s/'/''/g")
+  nvim --server "$best" --remote-expr "execute('edit +$line ' . fnameescape('$quoted'))" >/dev/null || exit 1
+  if [ -n "$TMUX" ]; then
+    panes=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}')
+    p=$bestpid
+    for i in 1 2 3 4 5 6 7 8; do
+      pane=$(printf '%s\\n' "$panes" | awk -v p="$p" '$1 == p { print $2 }')
+      if [ -n "$pane" ]; then tmux select-window -t "$pane"; tmux select-pane -t "$pane"; break; fi
+      p=$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null)
+      [ "\${p:-0}" -gt 1 ] || break
+    done
+  fi
+  echo "the running nvim"; exit 0
+fi
+if [ -n "$TMUX" ]; then tmux split-window -h nvim "+$line" "$f" && echo "a new tmux pane" && exit 0; fi
+setsid -f kitty nvim "+$line" "$f" >/dev/null 2>&1 && echo "a new kitty window"
+`
+
+// Opens the file in nvim and says where, or that it couldn't.
+const openInNvim = async (file: string, line: number) => {
+  try {
+    const proc = Bun.spawn(['sh', '-c', OPEN_IN_NVIM, 'sh', file, String(line)], { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' })
+    const where = (await new Response(proc.stdout).text()).trim()
+    if ((await proc.exited) === 0 && where) return `Opened ${shortPath(file)} in ${where}`
+  } catch {
+    // No sh, or it failed to start.
+  }
+
+  return `Couldn't open ${shortPath(file)} in nvim`
+}
+
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
@@ -270,7 +376,32 @@ const touchedBy = (repo: Repo) => {
   return branches
 }
 
+// The line of the new file each diff line stands at, or for a removed line the one after it.
+const newLineNumbers = (lines: string[]) => {
+  let next = 1
+
+  return lines.map(line => {
+    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)/)
+    if (hunk) next = Number(hunk[1])
+    const at = Math.max(1, next)
+    if (!hunk && !line.startsWith('-')) next++
+
+    return at
+  })
+}
+
 // ---- Rows ----
+
+// A diff's lines under the row `parent`, each knowing where it is in the new file.
+const diffRows = (parent: string, file: string, lines: string[], depth: number): Row[] => {
+  const numbers = newLineNumbers(lines)
+
+  return lines.map((line, n) => {
+    const color = line.startsWith('+') ? 'green' : line.startsWith('-') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined
+
+    return { key: `${parent}\t${n}`, parent, depth, file, line: numbers[n], node: <Text color={color} dimColor={!color} wrap="truncate-end">{line || ' '}</Text> }
+  })
+}
 
 // Every line of the view: each worktree's line, and when open its uncommitted files and its commits,
 // each open file's diff under it. `columns` is the width rows are laid out in.
@@ -295,6 +426,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       parent,
       depth: 1,
       canOpen: true,
+      isOpenByDefault: byDefault,
       node: (
         <Text wrap="truncate-end">
           <Text dimColor>{open ? '▾' : '▸'} </Text>
@@ -316,11 +448,14 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     const shared = tree.isBase ? [] : (others.get(change.path) ?? []).filter(b => b !== label(tree))
     const also = shared.length > 0 ? ` also in ${shared.join(', ')}` : ''
     const path = fitPath(change.path, Math.max(8, room(2) - 2 - stats.length - tag.length - also.length))
+    const file = `${tree.path}/${change.path}`
     rows.push({
       key,
       parent,
       depth: 2,
       canOpen: true,
+      file,
+      line: 1,
       node: (
         <Text wrap="truncate-end">
           {open ? '▾' : '▸'} <Text bold={open}>{path}</Text>
@@ -336,10 +471,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
     const diff = diffs.get(key)
     if (!diff) return note(`${key}\tloading`, key, 3, 'Loading…')
     if (diff.lines.length === 0) return note(`${key}\tempty`, key, 3, 'No textual changes.')
-    diff.lines.forEach((line, n) => {
-      const color = line.startsWith('+') ? 'green' : line.startsWith('-') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined
-      rows.push({ key: `${key}\t${n}`, parent: key, depth: 3, node: <Text color={color} dimColor={!color} wrap="truncate-end">{line || ' '}</Text> })
-    })
+    rows.push(...diffRows(key, file, diff.lines, 3))
     if (diff.isCut) note(`${key}\tcut`, key, 3, `… diff cut at ${MAX_DIFF_LINES} lines`)
   }
 
@@ -365,6 +497,7 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       key,
       depth: 0,
       canOpen: true,
+      isOpenByDefault: true,
       node: (
         <Text wrap="truncate-end">
           <Text dimColor>{open ? '▾' : '▸'} </Text>
@@ -402,24 +535,146 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
   return { rows, wanted }
 }
 
+// What a git status code says of a file, and its color.
+const statusOf = (code: string) =>
+  code === '??' ? { text: 'untracked', color: 'blue' }
+  : code.includes('D') ? { text: 'deleted', color: 'red' }
+  : code.includes('A') ? { text: 'new', color: 'blue' }
+  : { text: 'modified', color: 'yellow' }
+
+// The repo tab's lines: the worktree's folders first then its files, each open folder's insides under it,
+// and under an open file the file itself or, with `isDiff`, its diff against HEAD.
+const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) => boolean, views: Map<string, Diff>, isDiff: boolean) => {
+  const rows: Row[] = []
+  const wanted: Wanted[] = []
+  const note = (key: string, parent: string, depth: number, text: string) =>
+    rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
+
+  // Each folder's folders and files, '' the top.
+  const inside = new Map<string, { dirs: Set<string>; files: string[] }>()
+  const at = (dir: string) => {
+    if (!inside.has(dir)) inside.set(dir, { dirs: new Set(), files: [] })
+
+    return inside.get(dir)!
+  }
+  for (const file of files.files) {
+    const parts = file.split('/')
+    for (let k = 1; k < parts.length; k++) at(parts.slice(0, k - 1).join('/')).dirs.add(parts.slice(0, k).join('/'))
+    at(parts.slice(0, -1).join('/')).files.push(file)
+  }
+  const changed = Object.keys(files.status)
+
+  const walk = (dir: string, parent: string | undefined, depth: number) => {
+    for (const sub of [...at(dir).dirs].sort()) {
+      const key = `dir\t${sub}`
+      const open = isOpen(key, false)
+      const count = changed.filter(f => f.startsWith(`${sub}/`)).length
+      rows.push({
+        key,
+        parent,
+        depth,
+        canOpen: true,
+        node: (
+          <Text wrap="truncate-end">
+            <Text dimColor>{open ? '▾' : '▸'} </Text>
+            <Text color="blue">{sub.split('/').pop()}/</Text>
+            {count > 0 && <Text color="yellow"> ● {count} changed</Text>}
+          </Text>
+        ),
+      })
+      if (open) walk(sub, key, depth + 1)
+    }
+
+    for (const file of at(dir).files) {
+      const key = `file\t${file}`
+      const open = isOpen(key, false)
+      const code = files.status[file]
+      const state = code ? statusOf(code) : undefined
+      const path = `${files.dir}/${file}`
+      rows.push({
+        key,
+        parent,
+        depth,
+        canOpen: true,
+        file: path,
+        line: 1,
+        node: (
+          <Text wrap="truncate-end">
+            <Text dimColor>{open ? '▾' : '▸'} </Text>
+            <Text bold={open} color={state?.color}>{file.split('/').pop()}</Text>
+            {state && <Text dimColor> {state.text}</Text>}
+          </Text>
+        ),
+      })
+      if (!open) continue
+
+      const view = `${key}\t${isDiff ? 'diff' : 'file'}`
+      wanted.push({ key: view, tree: files.dir, file, isUntracked: code === '??', isWhole: !isDiff })
+      const shown = views.get(view)
+      if (!shown) {
+        note(`${view}\tloading`, key, depth + 1, 'Loading…')
+      } else if (shown.isUnreadable) {
+        note(`${view}\tunreadable`, key, depth + 1, `Not shown: binary, over ${MAX_FILE / 1_000_000} MB, or missing.`)
+      } else if (isDiff) {
+        if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'No changes since the last commit.')
+        rows.push(...diffRows(view, path, shown.lines, depth + 1))
+        if (shown.isCut) note(`${view}\tcut`, key, depth + 1, `… diff cut at ${MAX_DIFF_LINES} lines`)
+      } else {
+        if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'Empty file.')
+        const gutter = String(shown.lines.length).length
+        shown.lines.forEach((line, n) => {
+          rows.push({
+            key: `${view}\t${n}`,
+            parent: key,
+            depth: depth + 1,
+            file: path,
+            line: n + 1,
+            node: (
+              <Text wrap="truncate-end">
+                <Text dimColor>{String(n + 1).padStart(gutter)} </Text>
+                {line.replace(/\t/g, '    ') || ' '}
+              </Text>
+            ),
+          })
+        })
+        if (shown.isCut) note(`${view}\tcut`, key, depth + 1, `… cut at ${MAX_FILE_LINES} lines`)
+      }
+    }
+  }
+  walk('', undefined, 0)
+  if (files.files.length === 0) note('none', '', 0, 'No files.')
+
+  return { rows, wanted }
+}
+
 // ---- View ----
 
 const App = ({ root }: { root: string }) => {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const [size, setSize] = useState({ columns: stdout.columns, rows: stdout.rows })
+  const [tab, setTab] = useState<Tab>('worktrees')
   const [repo, setRepo] = useState<Repo | null | undefined>(undefined)
+  // The repo tab's files, read only while it is shown.
+  const [files, setFiles] = useState<Files | null | undefined>(undefined)
   // Bumped whenever a refresh finds something changed, so open uncommitted diffs are read again.
   const [version, setVersion] = useState(0)
   const [updatedAt, setUpdatedAt] = useState(0)
-  // The rows opened or closed against how they start.
+  // The rows opened or closed against how they start, in either tab.
   const [toggled, setToggled] = useState(new Set<string>())
+  // Diffs and, in the repo tab, whole files, by the row they sit under.
   const [diffs, setDiffs] = useState(new Map<string, Diff>())
-  const [cursor, setCursor] = useState('')
-  // Bumped to draw again after the wheel moves `top` and the cursor's row stays the same.
+  // Whether the repo tab shows an open file or its diff against HEAD.
+  const [isDiff, setIsDiff] = useState(false)
+  const [notice, setNotice] = useState('')
+  // Each tab keeps its own cursor and scroll.
+  const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
+  // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
   const [, redraw] = useState(0)
-  const top = useRef(0)
-  const lastIndex = useRef(0)
+  const tops = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0 })
+  const lastIndexes = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0 })
+  const tabRef = useRef(tab)
+  tabRef.current = tab
   const pending = useRef(new Set<string>())
   const refresh = useRef(async () => {})
 
@@ -434,21 +689,36 @@ const App = ({ root }: { root: string }) => {
 
   useEffect(() => {
     let isBusy = false
+    // A refresh asked for while one runs, run once it is done.
+    let isAgain = false
     let seen = ''
+    let seenFiles = ''
     refresh.current = async () => {
-      if (isBusy) return
+      if (isBusy) {
+        isAgain = true
+        return
+      }
       isBusy = true
       try {
-        const found = await loadRepo(root)
+        const [found, listed] = await Promise.all([loadRepo(root), tabRef.current === 'repo' ? loadFiles(root) : undefined])
         const text = JSON.stringify(found)
         if (text !== seen) {
           seen = text
           setRepo(found)
           setVersion(v => v + 1)
         }
+        const listedText = JSON.stringify(listed)
+        if (listed !== undefined && listedText !== seenFiles) {
+          seenFiles = listedText
+          setFiles(listed)
+        }
         setUpdatedAt(Date.now())
       } finally {
         isBusy = false
+      }
+      if (isAgain) {
+        isAgain = false
+        refresh.current()
       }
     }
     refresh.current()
@@ -457,33 +727,48 @@ const App = ({ root }: { root: string }) => {
     return () => clearInterval(timer)
   }, [root])
 
+  useEffect(() => {
+    if (!notice) return
+    const timer = setTimeout(() => setNotice(''), NOTICE_MS)
+
+    return () => clearTimeout(timer)
+  }, [notice])
+
   const isOpen = (key: string, byDefault: boolean) => byDefault !== toggled.has(key)
   // Gutter of two, and one column spare so a row never touches the edge and wraps.
   const columns = Math.max(20, size.columns - 3)
-  const { rows, wanted } = repo ? buildRows(repo, isOpen, diffs, columns) : { rows: [] as Row[], wanted: [] as Wanted[] }
+  const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
+  const { rows, wanted } =
+    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns) : empty
+  // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
+  const current = tab === 'repo' ? updatedAt : version
 
-  // Reads each open file's diff not yet read, and an uncommitted one again after a change.
+  // Reads each open file's diff or text not yet read, and an uncommitted one again after a change.
   useEffect(() => {
     for (const want of wanted) {
       const have = diffs.get(want.key)
-      if ((have && (want.commit || have.version === version)) || pending.current.has(want.key)) continue
+      if ((have && (want.commit || have.version === current)) || pending.current.has(want.key)) continue
       pending.current.add(want.key)
-      readDiff(want).then(diff => {
+      readView(want).then(view => {
         pending.current.delete(want.key)
-        setDiffs(cur => new Map(cur).set(want.key, { ...diff, version }))
+        setDiffs(cur => new Map(cur).set(want.key, { ...view, version: current }))
       })
     }
   })
 
   // The cursor stays on its row across refreshes; when that row goes, it stays where it was.
+  const cursor = cursors[tab]
   let index = rows.findIndex(r => r.key === cursor)
-  if (index === -1) index = Math.min(lastIndex.current, rows.length - 1)
-  lastIndex.current = Math.max(0, index)
+  if (index === -1) index = Math.min(lastIndexes.current[tab], rows.length - 1)
+  lastIndexes.current[tab] = Math.max(0, index)
   const height = Math.max(1, size.rows - 3)
-  if (index < top.current) top.current = Math.max(0, index)
-  if (index >= top.current + height) top.current = index - height + 1
-  top.current = Math.max(0, Math.min(top.current, rows.length - height))
+  let top = tops.current[tab]
+  if (index < top) top = Math.max(0, index)
+  if (index >= top + height) top = index - height + 1
+  top = Math.max(0, Math.min(top, rows.length - height))
+  tops.current[tab] = top
 
+  const setCursor = (key: string) => setCursors(cur => ({ ...cur, [tab]: key }))
   // Moves to row `k`, or on past it by `step` when it is a gap.
   const moveTo = (k: number, step: 1 | -1) => {
     let at = Math.max(0, Math.min(rows.length - 1, k))
@@ -497,34 +782,45 @@ const App = ({ root }: { root: string }) => {
     return next
   })
   const row = rows[index]
+  const parentOf = (r: Row) => rows.find(p => p.key === r.parent)
   // Opens or closes the row under the cursor, or the row it sits under when it does neither.
   const press = (want?: boolean) => {
     if (!row) return
-    const target = row.canOpen ? row : rows.find(r => r.key === row.parent)
+    const target = row.canOpen ? row : parentOf(row)
     if (!target) return
-    const byDefault = target.depth === 0 || target.key.endsWith('\tuncommitted')
-    if (want === undefined || isOpen(target.key, byDefault) !== want) toggle(target.key)
+    if (want === undefined || isOpen(target.key, target.isOpenByDefault === true) !== want) toggle(target.key)
     if (target !== row) setCursor(target.key)
+  }
+  const switchTab = (next: Tab) => {
+    if (next === tab) return
+    setTab(next)
+    tabRef.current = next
+    refresh.current()
   }
 
   // Scrolls the view by `lines`, bringing the cursor along when it would fall off the screen.
   const scroll = (lines: number) => {
-    top.current = Math.max(0, Math.min(rows.length - height, top.current + lines))
-    if (index < top.current) moveTo(top.current, 1)
-    else if (index >= top.current + height) moveTo(top.current + height - 1, -1)
+    const to = Math.max(0, Math.min(rows.length - height, top + lines))
+    tops.current[tab] = to
+    if (index < to) moveTo(to, 1)
+    else if (index >= to + height) moveTo(to + height - 1, -1)
     redraw(n => n + 1)
   }
 
   // A mouse report: SGR's "[<button;column;line" then M when pressed, m when let go.
-  // A left click puts the cursor on the row and opens or closes it; the wheel scrolls.
-  const onMouse = (button: number, line: number) => {
+  // A left click on a tab's name in the header switches to it; on a row it puts the cursor there
+  // and opens or closes it. The wheel scrolls.
+  const onMouse = (button: number, column: number, line: number) => {
     // Shift, alt and ctrl only add to the button's number.
     const base = button & ~(4 | 8 | 16)
     if (base === 64) return scroll(-WHEEL_LINES)
     if (base === 65) return scroll(WHEEL_LINES)
     if (base !== 0) return
+    // The header reads "kelp  worktrees repo": worktrees in columns 7 to 15, repo in 17 to 20.
+    if (line === 1 && column >= 7 && column <= 15) return switchTab('worktrees')
+    if (line === 1 && column >= 17 && column <= 20) return switchTab('repo')
     // The header is the first line, so the rows start on the second.
-    const clicked = rows[top.current + line - 2]
+    const clicked = rows[top + line - 2]
     if (line < 2 || line - 2 >= height || !clicked || clicked.isGap) return
     setCursor(clicked.key)
     if (clicked.canOpen) toggle(clicked.key)
@@ -533,10 +829,19 @@ const App = ({ root }: { root: string }) => {
   useInput((input, key) => {
     const mouse = input.match(/^\[<(\d+);(\d+);(\d+)([Mm])$/)
     if (mouse) {
-      if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[3]))
+      if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[2]), Number(mouse[3]))
     }
     else if (input === 'q') exit()
     else if (input === 'r') refresh.current()
+    else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
+    else if (input === '1') switchTab('worktrees')
+    else if (input === '2') switchTab('repo')
+    else if (input === 'd' && !key.ctrl && tab === 'repo') setIsDiff(v => !v)
+    else if (input === 'o') {
+      // A row with no file of its own, such as "Loading…", opens the file it sits under.
+      const at = row?.file ? row : row && parentOf(row)
+      if (at?.file) openInNvim(at.file, at.line ?? 1).then(setNotice)
+    }
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
     else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
     else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)
@@ -547,31 +852,44 @@ const App = ({ root }: { root: string }) => {
     else if (key.rightArrow || input === 'l') press(true)
     else if (key.leftArrow || input === 'h') {
       // Closes an open row, else steps out to the row it sits under.
-      const byDefault = row?.depth === 0 || row?.key.endsWith('\tuncommitted')
-      if (row?.canOpen && isOpen(row.key, byDefault === true)) toggle(row.key)
+      if (row?.canOpen && isOpen(row.key, row.isOpenByDefault === true)) toggle(row.key)
       else if (row?.parent) setCursor(row.parent)
     }
   })
 
-  const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
-  const header = repo ? (
-    <Text wrap="truncate-end">
-      <Text bold>kelp</Text>
-      <Text dimColor> {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
-      {shared > 0 && <Text color="yellow"> · {shared} file{shared === 1 ? '' : 's'} changed in more than one worktree</Text>}
-    </Text>
-  ) : (
-    <Text bold>kelp</Text>
+  const tabName = (name: Tab) => (
+    <Text bold={tab === name} dimColor={tab !== name} underline={tab === name}>{name}</Text>
   )
+  const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
+  const changed = files ? Object.keys(files.status).length : 0
+  const header = (
+    <Text wrap="truncate-end">
+      <Text bold>kelp</Text>  {tabName('worktrees')} {tabName('repo')}
+      {tab === 'worktrees' && repo && (
+        <Text dimColor>  {shortPath(repo.dir)} · {repo.trees.length} worktree{repo.trees.length === 1 ? '' : 's'} · base {repo.base}</Text>
+      )}
+      {tab === 'worktrees' && shared > 0 && <Text color="yellow"> · {shared} file{shared === 1 ? '' : 's'} changed in more than one worktree</Text>}
+      {tab === 'repo' && files && (
+        <Text dimColor>  {shortPath(files.dir)} · {files.files.length}{files.isCut ? '+' : ''} files · showing {isDiff ? 'diffs vs HEAD' : 'files'}</Text>
+      )}
+      {tab === 'repo' && changed > 0 && <Text color="yellow"> · {changed} changed</Text>}
+    </Text>
+  )
+  const keys =
+    tab === 'repo'
+      ? `↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · r refresh · q quit`
+      : '↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · wheel scroll · o nvim · tab repo · r refresh · q quit'
 
   return (
     <Box flexDirection="column" height={size.rows - 1}>
       {header}
       <Box flexDirection="column" flexGrow={1}>
-        {repo === undefined && <Text dimColor>Reading worktrees…</Text>}
-        {repo === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
-        {rows.slice(top.current, top.current + height).map((r, k) => {
-          const isCursor = top.current + k === index
+        {tab === 'worktrees' && repo === undefined && <Text dimColor>Reading worktrees…</Text>}
+        {tab === 'worktrees' && repo === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
+        {tab === 'repo' && files === undefined && <Text dimColor>Listing the repository…</Text>}
+        {tab === 'repo' && files === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
+        {rows.slice(top, top + height).map((r, k) => {
+          const isCursor = top + k === index
 
           return (
             <Box key={r.key} flexWrap="nowrap">
@@ -582,7 +900,8 @@ const App = ({ root }: { root: string }) => {
         })}
       </Box>
       <Text dimColor wrap="truncate-end">
-        ↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · wheel scroll · g G ends · r refresh · q quit{updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
+        {notice ? <Text color="yellow">{notice}</Text> : keys}
+        {!notice && updatedAt > 0 ? ` · updated ${clockTime(updatedAt)}` : ''}
       </Text>
     </Box>
   )
