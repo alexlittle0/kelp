@@ -198,6 +198,8 @@ type Tree = {
   isMerging: boolean
   isRebasing: boolean
   rebaseStep: string
+  // What its commits change against the base since it left it: files, and lines added and removed.
+  diffStat: { files: number; added: number; removed: number }
   // Its newest commit or edited file, ms since the epoch.
   lastAt: number
   // The coding agents running in it.
@@ -491,6 +493,13 @@ const readRebase = async (path: string) => {
   return null
 }
 
+// `git diff --shortstat`'s "3 files changed, 10 insertions(+), 2 deletions(-)" as numbers.
+const parseShortstat = (text: string) => {
+  const count = (pattern: RegExp) => Number(text.match(pattern)?.[1] ?? 0)
+
+  return { files: count(/(\d+) files? changed/), added: count(/(\d+) insertions?/), removed: count(/(\d+) deletions?/) }
+}
+
 const loadTree = async (w: { path: string; head: string; branch: string; isMain: boolean }, base: string, upstreams: Upstreams): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
@@ -507,6 +516,7 @@ const loadTree = async (w: { path: string; head: string; branch: string; isMain:
   const reflog = !isBase && ahead === 0 && w.branch ? await git(w.path, ['reflog', 'show', '--format=%gs', `refs/heads/${w.branch}`]) : null
   const isMerged = (reflog ?? '').split('\n').some(l => l.startsWith('commit'))
   const isMerging = mergeHead !== null
+  const shortstat = ahead > 0 ? await git(w.path, ['diff', '--shortstat', `${base}...HEAD`]) : ''
   const { merged, conflicts } = behind > 0 && !isMerging && !rebase ? await readConflicts(w.path, base, uncommitted.length > 0) : { merged: '', conflicts: [] }
   const edited = uncommitted.map(c => modifiedAt(`${w.path}/${c.path}`))
 
@@ -524,6 +534,7 @@ const loadTree = async (w: { path: string; head: string; branch: string; isMain:
     isMerging,
     isRebasing: rebase !== null,
     rebaseStep: rebase?.step ?? '',
+    diffStat: parseShortstat(shortstat ?? ''),
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
     agents: [],
     panes: [],
@@ -1524,6 +1535,8 @@ const buildRows = (
     } else if (tree.conflicts.length > 0) {
       parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'}`, color: 'red' })
     } else if (tree.merged) details.push({ text: `merges ${repo.base} in cleanly` })
+    const stat = tree.diffStat
+    if (stat.files > 0) details.push({ text: `${stat.files} file${stat.files === 1 ? '' : 's'} +${stat.added} -${stat.removed} vs ${repo.base}` })
     if (tree.isUpstreamGone) parts.push({ text: 'upstream gone', color: 'red' })
     // Its pull request: failing checks or asked-for changes on the line, the rest in the details.
     const pr = tree.isBase ? undefined : prs.get(tree.branch)
