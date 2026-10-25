@@ -223,6 +223,8 @@ type Tree = {
   agents: Agent[]
   // The tmux panes whose folder is in it.
   panes: Pane[]
+  // The ports that processes running in it listen on, reachable at localhost.
+  ports: number[]
   // The remote branch it tracks, such as "origin/feature", or '' when it tracks none,
   // how far it is ahead of and behind that, and whether that branch is gone from the remote.
   upstream: string
@@ -572,6 +574,7 @@ const loadTree = async (
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
     agents: [],
     panes: [],
+    ports: [],
     ...(upstreams.get(w.branch) ?? { upstream: '', unpushed: 0, unpulled: 0, isUpstreamGone: false }),
   }
 }
@@ -590,6 +593,11 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
     treeAt(trees, cwd)?.agents.push(rest)
   }
   for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
+  for (const { path, port } of findListening(trees)) {
+    const tree = trees.find(t => t.path === path)!
+    if (!tree.ports.includes(port)) tree.ports.push(port)
+  }
+  for (const tree of trees) tree.ports.sort((a, b) => a - b)
 
   return { dir, base, remote, github: githubPage(url), trees }
 }
@@ -998,6 +1006,71 @@ const startClaude = async (path: string, branch: string, prompt = '') => {
   const where = await openWindow(path, name, prompt ? ['claude', prompt] : ['claude'])
 
   return where ? `Started claude in ${branch}, in ${where} "${name}"` : `Couldn't start claude in ${shortPath(path)}`
+}
+
+// ---- Ports ----
+
+// Whether an address in /proc/net/tcp's hex can be reached at localhost: any address, or loopback.
+// IPv4 is one word, IPv6 four, each with its bytes reversed, so 127.0.0.1 is 0100007F.
+const isLocalAddress = (hex: string) => {
+  const isLocal4 = (ip: string) => ip === '00000000' || ip.endsWith('7F')
+  if (hex.length === 8) return isLocal4(hex)
+  if (hex.startsWith('0000000000000000FFFF0000')) return isLocal4(hex.slice(24))
+
+  return hex === '0'.repeat(32) || hex === '00000000000000000000000001000000'
+}
+
+// The sockets listening at localhost, by inode, and the port of each, from /proc/net/tcp and tcp6.
+const listeningSockets = () => {
+  const ports = new Map<string, number>()
+  for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let text = ''
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    for (const line of text.split('\n').slice(1)) {
+      // "sl local_address rem_address st … inode": state 0A is listening.
+      const fields = line.trim().split(/\s+/)
+      const [address, port] = (fields[1] ?? '').split(':')
+      if (fields[3] === '0A' && port && isLocalAddress(address)) ports.set(fields[9], parseInt(port, 16))
+    }
+  }
+
+  return ports
+}
+
+// The ports that processes in each of `trees` listen on: each process whose folder is in one, and the listening
+// sockets among its open files. None where there is no /proc, or for another user's processes.
+const findListening = (trees: { path: string }[]) => {
+  const sockets = listeningSockets()
+  if (sockets.size === 0) return []
+  let pids: string[]
+  try {
+    pids = readdirSync('/proc').filter(p => /^\d+$/.test(p))
+  } catch {
+    return []
+  }
+
+  return pids.flatMap(pid => {
+    try {
+      const tree = treeAt(trees, readlinkSync(`/proc/${pid}/cwd`))
+      if (!tree) return []
+
+      return readdirSync(`/proc/${pid}/fd`).flatMap(fd => {
+        try {
+          const inode = readlinkSync(`/proc/${pid}/fd/${fd}`).match(/^socket:\[(\d+)\]$/)?.[1]
+          const port = inode && sockets.get(inode)
+          return port ? [{ path: tree.path, port }] : []
+        } catch {
+          return []
+        }
+      })
+    } catch {
+      return []
+    }
+  })
 }
 
 // ---- GitHub ----
@@ -1623,6 +1696,7 @@ const buildRows = (
     // The port kelp hands its commands as $PORT.
     const port = portOf(tree)
     if (port) details.push({ text: `port ${port}` })
+    if (tree.ports.length > 0) details.push({ text: `serving ${tree.ports.map(p => `:${p}`).join(' ')}`, color: 'cyan' })
     // Its agents: one waiting for the person and a busy one on the line, the idle ones in the details.
     const waiting = tree.agents.filter(a => a.isWaiting)
     const busy = tree.agents.filter(a => a.isBusy !== false && !a.isWaiting)
