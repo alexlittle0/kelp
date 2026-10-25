@@ -1068,22 +1068,45 @@ const addTurns = (turns: Turn[], lines: string[]) => {
   turns.splice(0, Math.max(0, turns.length - MAX_TURNS))
 }
 
-// Each transcript's conversation, kept while the file is unchanged.
-const conversations = new Map<string, { at: number; turns: Turn[] }>()
+// Each transcript's conversation as read so far: how far into the file, in bytes, and its latest entries.
+const conversations = new Map<string, { offset: number; turns: Turn[] }>()
 
-// The latest entries of a transcript's conversation; `at` is when the transcript last changed.
-const readConversation = (file: string, at: number) => {
-  const cached = conversations.get(file)
-  if (cached?.at === at) return cached.turns
-  const turns: Turn[] = []
+// The latest entries of a transcript's conversation. The first read starts CONVERSATION_TAIL from its end;
+// after that only the lines claude has added since are read and parsed.
+const readConversation = (file: string) => {
+  let fd: number
   try {
-    addTurns(turns, readTail(file, CONVERSATION_TAIL).split('\n'))
+    fd = openSync(file, 'r')
   } catch {
-    // Gone, or unreadable.
+    return conversations.get(file)?.turns ?? []
   }
-  conversations.set(file, { at, turns })
+  try {
+    const size = fstatSync(fd).size
+    let conversation = conversations.get(file)
+    // Read afresh the first time, when the file got shorter, or when more was added than is worth catching up on.
+    const isAfresh = !conversation || size < conversation.offset || size - conversation.offset > CONVERSATION_TAIL
+    if (!conversation || isAfresh) {
+      conversation = { offset: Math.max(0, size - CONVERSATION_TAIL), turns: [] }
+      conversations.set(file, conversation)
+    }
+    const from = conversation.offset
+    if (size === from) return conversation.turns
+    const buffer = Buffer.alloc(size - from)
+    readSync(fd, buffer, 0, buffer.length, from)
+    // Whole lines only: an unfinished last line, still being written, is read again next time.
+    const end = buffer.lastIndexOf(10) + 1
+    if (end === 0) return conversation.turns
+    conversation.offset += end
+    const lines = buffer.subarray(0, end).toString('utf8').split('\n')
+    // Starting partway into the file, its first line is likely cut short.
+    addTurns(conversation.turns, isAfresh && from > 0 ? lines.slice(1) : lines)
 
-  return turns
+    return conversation.turns
+  } catch {
+    return conversations.get(file)?.turns ?? []
+  } finally {
+    closeSync(fd)
+  }
 }
 
 // When the machine started, ms since the epoch, which /proc's process start times count from.
@@ -1173,7 +1196,7 @@ const findAgents = () => {
     .map(({ name, pid, cwd }): Agent & { cwd: string } => {
       if (name !== 'claude') return { name, pid, cwd }
       const transcript = transcriptOf(pid, cwd)
-      const chat = transcript ? { session: transcript.name, turns: readConversation(transcript.file, transcript.at) } : {}
+      const chat = transcript ? { session: transcript.name, turns: readConversation(transcript.file) } : {}
 
       return { name, pid, cwd, ...claudeState(pid, transcript), spend: claudeSpend(cwd), ...chat }
     })
