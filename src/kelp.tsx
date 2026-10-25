@@ -88,6 +88,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'merge',
     keys: [
       ['u', 'merge the base branch into the worktree (twice)'],
+      ['m', 'merge the worktree\'s branch into the base branch (twice)'],
       ['U', 'abort a merge under way (twice)'],
     ],
   },
@@ -1294,6 +1295,58 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
   return { rows, wanted }
 }
 
+// ---- Actions ----
+
+// What the merge keys do to a worktree: u merges the base into it, m merges its branch into the base, U aborts.
+type Action = 'merge' | 'land' | 'abort'
+const ACTION_KEYS: Record<Action, string> = { merge: 'u', land: 'm', abort: 'U' }
+
+// An action's git, where it runs, what the first press asks, and what to say after by git's exit code
+// (0, or 1 for stopping on conflicts); any other code says it failed.
+type Step = { ask: string; cwd: string; args: string[]; said: Record<number, string> }
+
+// What an action would do to `tree`, or why it can't. m merges into the base in the base's own worktree,
+// as git can't move a branch another worktree has checked out, so that worktree must be clean too.
+const planFor = (action: Action, tree: Tree, repo: Repo): Step | string => {
+  const name = label(tree)
+  const base = repo.base
+  const baseTree = repo.trees.find(t => t.isBase)
+  const n = tree.conflicts.length
+  const conflicts = `${n} conflict${n === 1 ? '' : 's'}`
+  if (action === 'abort') {
+    if (!tree.isMerging) return `${name} is not merging anything.`
+
+    return { ask: `abort ${name}'s merge and put it back as it was`, cwd: tree.path, args: ['merge', '--abort'], said: { 0: `Aborted ${name}'s merge.` } }
+  }
+  if (tree.isBase) return action === 'merge' ? `${name} is the base branch.` : `${name} is the base branch: m merges another worktree's branch into it.`
+  if (tree.isMerging) return `${name} is merging ${base}: resolve and commit, or U to abort.`
+  if (tree.uncommitted.length > 0) return `${name} has uncommitted changes: commit them first.`
+
+  if (action === 'merge') {
+    if (tree.behind === 0) return `${name} already has everything in ${base}.`
+
+    return {
+      ask: `merge ${base} into ${name}${n > 0 ? `, leaving ${conflicts} to resolve` : ''}`,
+      cwd: tree.path,
+      args: ['merge', '--no-edit', base],
+      said: { 0: `Merged ${base} into ${name}.`, 1: `Merged ${base} into ${name} with conflicts: resolve them and commit, or U to abort.` },
+    }
+  }
+
+  if (!tree.branch) return `${name} is not on a branch.`
+  if (tree.ahead === 0) return `${name} has nothing ${base} doesn't.`
+  if (n > 0) return `${name} would conflict with ${base} (${conflicts}): u merges ${base} in to resolve them first.`
+  if (!baseTree) return `${base} is not checked out in any worktree to merge into.`
+  if (baseTree.uncommitted.length > 0 || baseTree.isMerging) return `${base}'s worktree has uncommitted changes: commit them first.`
+
+  return {
+    ask: `merge ${name} into ${base}${tree.behind === 0 ? ', a fast-forward' : ' with a merge commit'}`,
+    cwd: baseTree.path,
+    args: ['merge', '--no-edit', tree.branch],
+    said: { 0: `Merged ${name} into ${base}.`, 1: `Merging ${name} into ${base} conflicted after all: resolve it in ${base}'s worktree, or U there to abort.` },
+  }
+}
+
 // ---- View ----
 
 const App = ({ root }: { root: string }) => {
@@ -1532,31 +1585,19 @@ const App = ({ root }: { root: string }) => {
     if (clicked.canOpen) toggle(clicked.key)
   }
 
-  // Merges the base into the worktree under the cursor, or aborts the merge it is in, on a second press.
-  // A merge needs nothing uncommitted, and stops with its conflicts in the files for the person to resolve and commit.
-  const act = (kind: 'merge' | 'abort') => {
+  // Runs what a key plans for the worktree under the cursor on its second press, the first saying what it will do.
+  const act = (action: Action) => {
     const tree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
     if (!repo || !tree) return
-    const name = label(tree)
-    if (kind === 'abort' && !tree.isMerging) return setNotice(`${name} is not merging anything.`)
-    if (kind === 'merge') {
-      if (tree.isBase) return setNotice(`${name} is the base branch.`)
-      if (tree.isMerging) return setNotice(`${name} is already merging ${repo.base}: resolve and commit, or U to abort.`)
-      if (tree.behind === 0) return setNotice(`${name} already has everything in ${repo.base}.`)
-      if (tree.uncommitted.length > 0) return setNotice(`${name} has uncommitted changes: commit them first.`)
-    }
-    const n = tree.conflicts.length
-    const leaving = n > 0 ? `, leaving ${n} conflict${n === 1 ? '' : 's'} to resolve` : ''
-    const asking = kind === 'merge' ? `Merge ${repo.base} into ${name}${leaving}` : `Abort ${name}'s merge and put it back as it was`
+    const step = planFor(action, tree, repo)
+    if (typeof step === 'string') return setNotice(step)
 
-    confirm(kind === 'merge' ? 'u' : 'U', asking, async () => {
-      setNotice(kind === 'merge' ? `Merging ${repo.base} into ${name}…` : `Aborting ${name}'s merge…`)
-      const run = await gitRun(tree.path, kind === 'merge' ? ['merge', '--no-edit', repo.base] : ['merge', '--abort'])
+    confirm(ACTION_KEYS[action], `${step.ask[0].toUpperCase()}${step.ask.slice(1)}`, async () => {
+      const command = `git ${step.args.join(' ')}`
+      setNotice(`Running ${command} in ${shortPath(step.cwd)}…`)
+      const run = await gitRun(step.cwd, step.args, { GIT_EDITOR: 'true' })
       await refresh.current()
-      if (kind === 'abort') return setNotice(run?.code === 0 ? `Aborted ${name}'s merge.` : `Could not abort: run git merge --abort in ${shortPath(tree.path)} to see why.`)
-      if (run?.code === 0) return setNotice(`Merged ${repo.base} into ${name}.`)
-      if (run?.code === 1) return setNotice(`Merged ${repo.base} into ${name} with conflicts: resolve them and commit, or U to abort.`)
-      setNotice(`The merge failed: run git merge ${repo.base} in ${shortPath(tree.path)} to see why.`)
+      setNotice((run && step.said[run.code]) || `${command} failed: run it in ${shortPath(step.cwd)} to see why.`)
     })
   }
 
@@ -1661,6 +1702,7 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'q') exit()
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
+    else if (input === 'm' && tab === 'worktrees') act('land')
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()
