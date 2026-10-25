@@ -261,8 +261,8 @@ type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean;
 type Tokens = { input: number; output: number; write5m: number; write1h: number; read: number }
 
 // What a claude's session has used: its tokens, all kinds together, and what they cost in dollars,
-// undefined when a model it used has no known price.
-type Spend = { tokens: number; dollars?: number }
+// undefined when a model it used has no known price; and how full its context window is, 0 to 1.
+type Spend = { tokens: number; dollars?: number; context: number }
 
 // How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working;
 // `turnAt` when the person last prompted it, 0 when that is not in the part read.
@@ -1184,8 +1184,9 @@ const answerAsking = async (pane: Pane, isAllowed: boolean, instead = '') => {
 // ---- Spend ----
 
 // Each transcript's tokens counted so far, by file: how far into it has been read, the messages counted
-// (claude writes a line for each block of a message, each with the whole message's usage), and the tokens by model.
-type Usage = { offset: number; ids: Set<string>; models: Map<string, Tokens> }
+// (claude writes a line for each block of a message, each with the whole message's usage), the tokens by model,
+// and the last message's model and the tokens of its whole prompt, which is how much of the context it fills.
+type Usage = { offset: number; ids: Set<string>; models: Map<string, Tokens>; model: string; context: number }
 const usages = new Map<string, Usage>()
 
 // Reads on in a transcript from where it was last read, up to USAGE_CHUNK, adding each new assistant message's
@@ -1202,7 +1203,7 @@ const readUsage = (file: string) => {
   try {
     const size = fstatSync(fd).size
     if (!usage || size < usage.offset) {
-      usage = { offset: 0, ids: new Set(), models: new Map() }
+      usage = { offset: 0, ids: new Set(), models: new Map(), model: '', context: 0 }
       usages.set(file, usage)
     }
     const length = Math.min(size - usage.offset, USAGE_CHUNK)
@@ -1214,6 +1215,7 @@ const readUsage = (file: string) => {
     usage.offset += end
     type Entry = {
       type?: string
+      isSidechain?: boolean
       message?: {
         id?: string
         model?: string
@@ -1247,6 +1249,11 @@ const readUsage = (file: string) => {
       tokens.write1h += write1h
       tokens.read += u.cache_read_input_tokens ?? 0
       usage.models.set(model, tokens)
+      // A subagent's messages, which older transcripts keep among the session's own, fill its context, not the session's.
+      if (model !== '<synthetic>' && !entry.isSidechain) {
+        usage.model = model
+        usage.context = (u.input_tokens ?? 0) + written + (u.cache_read_input_tokens ?? 0)
+      }
     }
 
     return usage
@@ -1296,17 +1303,35 @@ const dollarsOf = (model: string, t: Tokens) => {
   return (t.input * price.input + t.output * price.output + t.write5m * price.input * 1.25 + t.write1h * price.input * 2 + t.read * read) / 1_000_000
 }
 
-// What the session of a claude in `cwd` has used, from its newest transcript; undefined when it has none.
+// The tokens a model's context holds: 200K for claude-haiku-4-5, claude-sonnet-4-5 and older, unless run with "[1m]",
+// 1M for the rest. A prompt already past 200K shows the model has the long one.
+const windowOf = (model: string, context: number) =>
+  model.endsWith('[1m]') || context > 200_000 || !/^claude-(3\b|\w+-4(-[0-5])?$)/.test(modelName(model)) ? 1_000_000 : 200_000
+
+// The transcripts of the subagents a session started, which claude keeps in <session>/subagents/ beside its own.
+const subagentTranscripts = (file: string) => {
+  const dir = `${file.replace(/\.jsonl$/, '')}/subagents`
+  try {
+    return readdirSync(dir).filter(f => f.endsWith('.jsonl')).map(f => `${dir}/${f}`)
+  } catch {
+    return []
+  }
+}
+
+// What the session of a claude in `cwd` has used, from its newest transcript, its subagents' counted in;
+// undefined when it has none. Its context is its own.
 const claudeSpend = (cwd: string): Spend | undefined => {
   const transcript = newestTranscript(cwd)
   const usage = transcript && readUsage(transcript.file)
   if (!usage) return undefined
-  const used = [...usage.models].map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
+  const all = [usage, ...subagentTranscripts(transcript.file).flatMap(f => readUsage(f) ?? [])].flatMap(u => [...u.models])
+  const used = all.map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
   const costs = used.map(m => dollarsOf(m.model, m.t))
 
   return {
     tokens: used.reduce((n, m) => n + m.tokens, 0),
     dollars: costs.includes(undefined) ? undefined : costs.reduce((n: number, c) => n + c!, 0),
+    context: usage.context / windowOf(usage.model, usage.context),
   }
 }
 
@@ -2303,9 +2328,12 @@ const buildRows = (
     if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
     // How long each busy agent has been at its current turn.
     for (const agent of busy.filter(a => a.turnAt)) details.push({ text: `${agent.name} working ${duration(Date.now() - agent.turnAt!)}` })
-    // What each claude's session has cost so far, or with a model of unknown price the tokens it used.
+    // What each claude's session has cost so far, or with a model of unknown price the tokens it used,
+    // and how full its context is: yellow from 80%, red from 95%, as it nears compacting.
     for (const { name, spend } of tree.agents.filter(a => a.spend)) {
-      details.push({ text: `${name} ${spend!.dollars !== undefined ? dollarCount(spend!.dollars) : `${tokenCount(spend!.tokens)} tokens`}` })
+      const { dollars, tokens, context } = spend!
+      details.push({ text: `${name} ${dollars !== undefined ? dollarCount(dollars) : `${tokenCount(tokens)} tokens`}` })
+      if (context > 0) details.push({ text: `${Math.round(context * 100)}% context`, color: context >= 0.95 ? 'red' : context >= 0.8 ? 'yellow' : undefined })
     }
     // What each agent not at work last said, or asks to run, so it can be read without going there.
     for (const agent of tree.agents.filter(a => a.says && !a.isBusy)) {
