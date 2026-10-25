@@ -50,6 +50,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `o` open in nvim at the line under the cursor
 - `t` jump to the worktree in tmux, or open a window there
 - `a` start claude in the worktree, in a new window
+- `A` go to the next worktree with an agent waiting for you; press it again soon to go on to its tmux pane
 - `n` new worktree
 - `x` (twice) remove the worktree, deleting its branch when merged; `X` (twice) even with uncommitted changes or unmerged commits
 - `C` (twice) clean up: prune missing worktrees, remove clean merged ones
