@@ -95,6 +95,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'worktrees',
     keys: [
       ['n', 'new worktree: asks for a branch'],
+      ['x', 'remove the worktree, and its branch when merged (twice)'],
+      ['X', 'remove it even with uncommitted changes or unmerged commits (twice)'],
     ],
   },
   {
@@ -1056,6 +1058,28 @@ const copyFiles = (from: string, to: string, files: string[]) => {
   } catch (e) {
     return e instanceof Error ? e.message : 'copying failed'
   }
+}
+
+const plural = (n: number, what: string) => `${n} ${what}${n === 1 ? '' : 's'}`
+
+// Whether x, or X forcing it, may remove `tree`: why not, or what the first press says and whether its branch
+// goes too, as only a branch fully in the base is deleted. Never the main worktree, the base's, kelp's own,
+// or one an agent is working in.
+const planRemoval = (tree: Tree, repo: Repo, root: string, isForce: boolean) => {
+  const name = label(tree)
+  if (tree.isMain) return `${name} is the main worktree, which git can't remove.`
+  if (tree.isBase) return `${name} has the base branch checked out.`
+  if (root === tree.path || root.startsWith(`${tree.path}/`)) return `kelp is running in ${name}.`
+  if (tree.agents.length > 0) return `${[...new Set(tree.agents.map(a => a.name))].join(', ')} is running in ${name}: stop it first.`
+  const n = tree.uncommitted.length
+  const unmerged = `${plural(tree.ahead, 'commit')} not in ${repo.base}`
+  const why = [n > 0 && plural(n, 'uncommitted file'), tree.ahead > 0 && unmerged].filter(Boolean).join(' and ')
+  if (why && !isForce) return `${name} has ${why}: X removes it anyway.`
+  const isBranchGone = tree.branch !== '' && tree.ahead === 0
+  const losing = isForce && n > 0 ? `, throwing away ${plural(n, 'uncommitted file')}` : ''
+  const branch = !tree.branch ? '' : isBranchGone ? `, and delete its branch, fully in ${repo.base}` : `, keeping its branch, with ${unmerged}`
+
+  return { ask: `Remove ${name}${losing}${branch}`, isBranchGone }
 }
 
 // ---- Formatting ----
@@ -2152,6 +2176,33 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
+  // Removes the worktree under the cursor on a second press of x, or of X to force it past uncommitted changes
+  // and unmerged commits, deleting its branch when that is fully in the base and keeping it otherwise.
+  const removeTree = (isForce: boolean) => {
+    const tree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
+    if (!repo || !tree) return
+    const plan = planRemoval(tree, repo, root, isForce)
+    if (typeof plan === 'string') return setNotice(plan)
+
+    confirm(isForce ? 'X' : 'x', plan.ask, async () => {
+      const name = label(tree)
+      const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
+      setNotice(`Removing ${name}…`)
+      const failed = await gitDo(main, ['worktree', 'remove', ...(isForce ? ['--force'] : []), tree.path])
+      if (failed) {
+        await refresh.current()
+        return setNotice(`Couldn't remove ${name}: ${failed}`)
+      }
+      setJob(tree.path)
+      // Checked again, as the branch may have moved since the first press.
+      const isMerged = plan.isBranchGone && (await git(main, ['merge-base', '--is-ancestor', tree.branch, repo.base])) !== null
+      const isDeleted = isMerged && (await gitDo(main, ['branch', '-D', tree.branch])) === null
+      await refresh.current()
+      const branch = !tree.branch ? '' : isDeleted ? ` and its branch, fully in ${repo.base}` : `; kept its branch ${tree.branch}, not fully in ${repo.base}`
+      setNotice(`Removed ${name}${branch}.`)
+    })
+  }
+
   // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
   const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
     const p = promptRef.current!
@@ -2294,6 +2345,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       if (at?.file) openInNvim(at.file, at.line ?? 1).then(setNotice)
     }
     else if (input === 'n' && tab === 'worktrees' && repo) ask('new worktree for branch', createTree)
+    else if ((input === 'x' || input === 'X') && tab === 'worktrees') removeTree(input === 'X')
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
     else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
     else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)

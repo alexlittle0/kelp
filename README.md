@@ -27,6 +27,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run. `t` jumps to the worktree: to its tmux pane when it has one, else to a new tmux window there named after its branch, or outside tmux a new kitty window. `a` starts claude in the worktree in a new window named "<branch> claude"
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **new worktrees**: `n` asks for a branch name and makes a worktree for it: the branch when it exists, here or on origin, else a new one from the base. It goes beside the other worktrees when they share a folder, else next to the repository as `<repo>-<branch>`. It then gets a copy of the main worktree's ignored `.env` and `.env.*` files, and runs the setup in an optional `.kelp.json` at the main worktree's root, `{ "copy": ["node_modules"], "postCreate": ["bun install"] }`: more ignored files or folders to copy, then commands to run in it, its progress shown under its line
+- **removing**: `x` (twice) removes the worktree under the cursor, and its branch when that is fully in the base, keeping it otherwise and saying which. It won't while the worktree has uncommitted changes or commits the base lacks, and says so; `X` (twice) removes it anyway, its branch kept. Never the main worktree, the base's, the one kelp runs in, or one an agent is working in
 - **repo**: a second tab with the file tree of the worktree kelp runs in; open a file to read it, or press `d` to see its diff against HEAD instead. Changed files and the folders holding them are marked
 - **run**: press `!` to run a shell command in the worktree under the cursor (in the repo tab, the one explored). The end of its output streams in under the worktree with its exit code and how long it took, and the worktree's line shows how it is doing. Several can run at once, in different worktrees, while you keep using kelp. A long-running one, such as a dev server, shows how long it has been up and the localhost address it prints; `K` (twice) stops it and all it started, and on a command that has ended clears it away. Commands still running stop when kelp quits
 - **commands**: press `:` to run one of the worktree's named commands, by typing its name or the start of it. They come from `"commands"` in a `.kelp.json` at the repository's root, such as `{ "commands": { "test": "bun test", "dev": "bun run dev" } }`, or, without one, from package.json's scripts
@@ -44,6 +45,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `t` jump to the worktree in tmux, or open a window there
 - `a` start claude in the worktree, in a new window
 - `n` new worktree
+- `x` (twice) remove the worktree, deleting its branch when merged; `X` (twice) even with uncommitted changes or unmerged commits
 - `u` merge the base in
 - `m` merge into the base
 - `R` (twice) rebase onto the base, again to carry on once conflicts are resolved
