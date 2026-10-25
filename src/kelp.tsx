@@ -66,10 +66,15 @@ type Tree = {
   lastAt: number
   // The coding agents running in it.
   agents: Agent[]
+  // The tmux panes whose folder is in it.
+  panes: Pane[]
 }
 
 // A coding agent running in a worktree; `isBusy` is known only for claude, from its transcript.
 type Agent = { name: string; pid: number; isBusy?: boolean }
+
+// A tmux pane: its id, its window as "session:index", that window's name, and what it runs.
+type Pane = { id: string; window: string; windowName: string; command: string }
 
 type Repo = { dir: string; base: string; trees: Tree[] }
 
@@ -292,6 +297,7 @@ const loadTree = async (w: { path: string; head: string; branch: string }, base:
     isMerging,
     lastAt: Math.max(Number(headAt ?? 0) * 1000, ...edited),
     agents: [],
+    panes: [],
   }
 }
 
@@ -301,12 +307,13 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   if (!dir) return null
   const worktrees = await listWorktrees(dir)
   const base = await findBase(dir, worktrees[0]?.branch ?? '')
-  const trees = await Promise.all(worktrees.map(w => loadTree(w, base)))
+  const [trees, panes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base))), listPanes()])
   trees.sort((a, b) => Number(b.isBase) - Number(a.isBase) || label(a).localeCompare(label(b)))
   for (const agent of findAgents()) {
     const { cwd, ...rest } = agent
     treeAt(trees, cwd)?.agents.push(rest)
   }
+  for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
 
   return { dir, base, trees }
 }
@@ -502,6 +509,25 @@ const findAgents = () => {
     })
 }
 
+// Every tmux pane but kelp's own and the folder it is in, when kelp runs inside tmux.
+const listPanes = async () => {
+  if (!process.env.TMUX) return []
+  try {
+    const format = ['#{pane_id}', '#{session_name}:#{window_index}', '#{window_name}', '#{pane_current_command}', '#{pane_current_path}'].join('\t')
+    const proc = Bun.spawn(['tmux', 'list-panes', '-a', '-F', format], { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' })
+    const out = await new Response(proc.stdout).text()
+    if ((await proc.exited) !== 0) return []
+
+    return out
+      .split('\n')
+      .map(line => line.split('\t'))
+      .filter(f => f.length === 5 && f[0] !== process.env.TMUX_PANE)
+      .map(([id, window, windowName, command, path]) => ({ id, window, windowName, command, path }))
+  } catch {
+    return []
+  }
+}
+
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
@@ -669,6 +695,8 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       const text = `${agent.isBusy === false ? '○' : '●'} ${count > 1 ? `${count} ` : ''}${agent.name}`
       parts.push({ text, color: agent.isBusy ? 'green' : agent.isBusy === undefined ? 'cyan' : undefined })
     }
+    // Its tmux panes, by what they run.
+    if (tree.panes.length > 0) parts.push({ text: `tmux ${[...new Set(tree.panes.map(p => p.command))].join(', ')}` })
     if (tree.isBase) parts.push({ text: 'base' })
     if (tree.ahead > 0) parts.push({ text: `${tree.ahead} ahead`, color: 'green' })
     if (tree.behind > 0) parts.push({ text: `${tree.behind} behind`, color: 'yellow' })
