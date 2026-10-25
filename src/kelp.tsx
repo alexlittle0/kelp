@@ -1332,14 +1332,27 @@ const findUrl = (line: string) => {
 
 const isRunning = (run?: Run) => run !== undefined && run.endedAt === undefined
 
+type PortTree = { path: string; branch: string; isBase: boolean }
+
 // The port a worktree's dev server should listen on, from a hash of its branch (its folder when detached);
-// none for the base branch's worktree, which keeps the app's own default.
-const portOf = (tree: { path: string; branch: string; isBase: boolean }) =>
-  tree.isBase ? undefined : PORT_FROM + Number(BigInt(Bun.hash(tree.branch || tree.path)) % BigInt(PORT_COUNT))
+// none for the base branch's worktree, which keeps the app's own default. When two of `trees` hash to the same port,
+// the later by branch name takes the next free one, so each worktree's port is its own.
+const portOf = (tree: PortTree, trees: PortTree[]) => {
+  if (tree.isBase) return undefined
+  const taken = new Set<number>()
+  const name = (t: PortTree) => t.branch || t.path
+  const others = trees.filter(t => !t.isBase && t.path !== tree.path)
+  for (const t of [...others, tree].sort((a, b) => name(a).localeCompare(name(b)))) {
+    let port = PORT_FROM + Number(BigInt(Bun.hash(name(t))) % BigInt(PORT_COUNT))
+    while (taken.has(port)) port = PORT_FROM + ((port - PORT_FROM + 1) % PORT_COUNT)
+    if (t === tree) return port
+    taken.add(port)
+  }
+}
 
 // What kelp tells every command it runs in a worktree: its port as PORT and KELP_PORT, its branch, its folder and the base branch.
-const kelpEnv = (tree: { path: string; branch: string; isBase: boolean }, base: string): Record<string, string> => {
-  const port = portOf(tree)
+const kelpEnv = (tree: PortTree, trees: PortTree[], base: string): Record<string, string> => {
+  const port = portOf(tree, trees)
 
   return { ...(port ? { PORT: String(port), KELP_PORT: String(port) } : {}), KELP_BRANCH: tree.branch, KELP_WORKTREE: tree.path, KELP_BASE: base }
 }
@@ -2043,7 +2056,7 @@ const buildRows = (
       if (isRunning(run) && run.url) details.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
     // The port kelp hands its commands as $PORT.
-    const port = portOf(tree)
+    const port = portOf(tree, repo.trees)
     if (port) details.push({ text: `port ${port}` })
     if (tree.ports.length > 0) details.push({ text: `serving ${tree.ports.map(p => `:${p}`).join(' ')}`, color: 'cyan' })
     // Its agents: one waiting for the person and a busy one on the line, the idle ones in the details.
@@ -2969,7 +2982,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       }
       done.push(`copied ${files.join(', ')}`)
     }
-    if (await runHooks(path, config.postCreate, kelpEnv({ path, branch, isBase: false }, repo.base))) return path
+    if (await runHooks(path, config.postCreate, kelpEnv({ path, branch, isBase: false }, [...repo.trees, { path, branch, isBase: false }], repo.base))) return path
     done.push(...config.postCreate.map(command => `ran ${command}`))
     setJob(path)
     setNotice(done.join(', '))
@@ -3020,7 +3033,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const run = runs.get(tree.path)
     const printed = isRunning(run) && run!.url ? run!.url.replace(/^(https?:\/\/)?(0\.0\.0\.0|\[::\])/, '$1localhost') : ''
     const printedPort = Number(printed.match(/:(\d+)/)?.[1] ?? 0)
-    const port = tree.ports.find(p => p === portOf(tree)) ?? tree.ports[0]
+    const port = tree.ports.find(p => p === portOf(tree, repo?.trees ?? [])) ?? tree.ports[0]
     const url = printed && (!port || tree.ports.includes(printedPort)) ? printed : port ? `localhost:${port}` : ''
 
     return url && !/^https?:\/\//.test(url) ? `http://${url}` : url
@@ -3031,7 +3044,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const tree = treeUnder()
     if (!tree) return setNotice('Put the cursor on a worktree to open its dev server.')
     const url = serverUrl(tree)
-    const port = portOf(tree)
+    const port = portOf(tree, repo?.trees ?? [])
     if (!url) return setNotice(`${label(tree)} serves nothing: start its dev server with ! or :${port ? `, on $PORT ${port}` : ''}.`)
     setNotice(openInBrowser(url))
   }
@@ -3180,7 +3193,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     confirm(isForce ? 'X' : 'x', `${plan.ask}${hooks}`, async () => {
       const name = label(tree)
       // A preRemove command that fails keeps the worktree, unless X forces it.
-      const hookFailed = await runHooks(tree.path, preRemove, kelpEnv(tree, repo.base))
+      const hookFailed = await runHooks(tree.path, preRemove, kelpEnv(tree, repo.trees, repo.base))
       if (hookFailed && !isForce) return setNotice(`Kept ${name}: ${hookFailed}. X removes it anyway.`)
       setNotice(`Removing ${name}…`)
       const failed = await gitDo(main, ['worktree', 'remove', ...(isForce ? ['--force'] : []), tree.path])
@@ -3218,7 +3231,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       const removed: string[] = []
       const { preRemove } = readConfig(main)
       for (const tree of merged) {
-        const failed = (await runHooks(tree.path, preRemove, kelpEnv(tree, repo.base))) ?? (await gitDo(main, ['worktree', 'remove', tree.path]))
+        const failed = (await runHooks(tree.path, preRemove, kelpEnv(tree, repo.trees, repo.base))) ?? (await gitDo(main, ['worktree', 'remove', tree.path]))
         if (failed) {
           failures.push(`${label(tree)}: ${failed}`)
           continue
@@ -3283,7 +3296,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (isRunning(running)) return setNotice(`${treeName(tree)} still runs ${running!.command}; K twice stops it`)
     const at = repo && treeAt(repo.trees, tree)
     try {
-      startRun(tree, command, at ? kelpEnv(at, repo.base) : {}, drawRunsSoon)
+      startRun(tree, command, at ? kelpEnv(at, repo.trees, repo.base) : {}, drawRunsSoon)
     } catch {
       return setNotice(`Couldn't run ${command} in ${shortPath(tree)}`)
     }
