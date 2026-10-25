@@ -46,6 +46,11 @@ const STASH_ENV = {
   GIT_COMMITTER_EMAIL: 'kelp@localhost',
   GIT_COMMITTER_DATE: '@0 +0000',
 }
+// Fetching never stops to ask for a password, as kelp has no terminal to ask in: it fails instead.
+const FETCH_ENV: Record<string, string> = {
+  GIT_TERMINAL_PROMPT: '0',
+  ...(process.env.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' }),
+}
 // The coding agents kelp looks for among running processes.
 const AGENTS = ['claude', 'codex', 'aider', 'gemini', 'opencode', 'cursor-agent']
 // A claude counts as busy while its transcript was written this recently.
@@ -141,6 +146,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['p', 'push the branch, setting its upstream the first time'],
       ['P', 'push and open a pull request with gh (twice)'],
       ['b', 'open its pull request, or branch, on GitHub'],
+      ['f', 'fetch every remote, then refresh'],
     ],
   },
   {
@@ -1857,6 +1863,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   tabRef.current = tab
   const pending = useRef(new Set<string>())
   const refresh = useRef(async () => {})
+  const isFetching = useRef(false)
   // The pull requests by branch, fetched from GitHub on their own slower clock so they never hold up a refresh.
   const [prs, setPrs] = useState(new Map<string, Pr>())
   const fetchPrs = useRef(async () => {})
@@ -2172,6 +2179,17 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
+  // Fetches every remote in the background, then refreshes; quiet when the repository has none.
+  const fetchAll = async () => {
+    if (!repo?.remote || isFetching.current) return
+    isFetching.current = true
+    setNotice('Fetching every remote…')
+    const run = await gitRun(repo.dir, ['fetch', '--all', '--prune', '--quiet'], FETCH_ENV)
+    isFetching.current = false
+    await refresh.current()
+    setNotice(run?.code === 0 ? 'Fetched every remote.' : `Couldn't fetch: run git fetch --all in ${shortPath(repo.dir)} to see why.`)
+  }
+
   // Asks `label` in the footer, then calls `onDone` with the answer, unless esc is pressed.
   const ask = (label: string, onDone: (answer: string) => void, text = '', more: Pick<Prompt, 'onChange' | 'onCancel'> = {}) =>
     setPrompt({ label, text, onDone, ...more })
@@ -2442,6 +2460,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
     else if (input === 'R' && tab === 'worktrees') act('rebase')
     else if (input === 'S' && tab === 'worktrees') syncAll()
+    else if (input === 'f') fetchAll()
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()

@@ -62,6 +62,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `p` push the branch
 - `P` (twice) open a pull request with gh
 - `b` open the pull request or branch on GitHub
+- `f` fetch every remote in the background, then refresh
 - `y` copy the path of the file or worktree
 - `e` open the file or worktree in `$EDITOR`
 - `w` switch to the worktree: quit and cd there
