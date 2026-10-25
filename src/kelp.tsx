@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
@@ -25,6 +25,8 @@ const RUN_KEEP = 200
 const RUN_LINES = 12
 // Lines the view moves per turn of the mouse wheel.
 const WHEEL_LINES = 3
+// Ignored files a new worktree gets a copy of from the main one, besides those .kelp.json names.
+const COPY_ALWAYS = ['.env', '.env.*', '**/.env', '**/.env.*']
 // How often the pull requests are fetched from GitHub, apart from the main refresh, and how many at most.
 const PR_REFRESH_MS = 60_000
 const MAX_PRS = 50
@@ -208,6 +210,9 @@ type Armed = { input: string; row: string; text: string; run: () => void }
 // A shell command run in a worktree: what and when, its last lines of output, the localhost address it mentions,
 // and once it ends its exit code (null when a signal stopped it).
 type Run = { tree: string; command: string; startedAt: number; endedAt?: number; code?: number | null; lines: string[]; url?: string; pid: number }
+
+// What kelp is doing to a worktree, such as running its postCreate commands, shown under its line; `isFailed` once it went wrong.
+type Job = { text: string; isFailed?: boolean }
 
 // One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
 // `isOpenByDefault` whether it starts open, `isGap` a blank line between worktrees that the cursor passes over,
@@ -957,6 +962,46 @@ const addTree = async (repo: Repo, branch: string, path: string) => {
   return gitDo(repo.dir, isKnown ? ['worktree', 'add', path, branch] : ['worktree', 'add', '-b', branch, path, repo.base])
 }
 
+// .kelp.json at the main worktree's root: { "copy": [globs of ignored files to copy into a new worktree],
+// "postCreate": [commands run in it after] }. `error` when it is there but can't be read.
+const readConfig = (dir: string) => {
+  const strings = (v: unknown) => (Array.isArray(v) ? v.filter(s => typeof s === 'string') : [])
+  if (!existsSync(`${dir}/.kelp.json`)) return { copy: [], postCreate: [] }
+  try {
+    const config = JSON.parse(readFileSync(`${dir}/.kelp.json`, 'utf8'))
+
+    return { copy: strings(config.copy), postCreate: strings(config.postCreate) }
+  } catch {
+    return { copy: [], postCreate: [], error: "Couldn't read .kelp.json" }
+  }
+}
+
+// The files git ignores in `dir` that a new worktree needs too: .env files, and those .kelp.json's copy names.
+// An ignored folder git lists whole, such as node_modules/, matches by its name without the slash.
+const localFiles = async (dir: string, globs: string[]) => {
+  const ignored = (await git(dir, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'])) ?? ''
+  const patterns = [...COPY_ALWAYS, ...globs].map(g => new Bun.Glob(g))
+
+  return ignored
+    .split('\0')
+    .map(f => f.replace(/\/$/, ''))
+    .filter(f => f && patterns.some(p => p.match(f)))
+}
+
+// Copies each file or folder from one worktree to another, leaving any already there alone. Null when it worked, else why not.
+const copyFiles = (from: string, to: string, files: string[]) => {
+  try {
+    for (const file of files) {
+      mkdirSync(dirname(`${to}/${file}`), { recursive: true })
+      cpSync(`${from}/${file}`, `${to}/${file}`, { recursive: true, force: false })
+    }
+
+    return null
+  } catch (e) {
+    return e instanceof Error ? e.message : 'copying failed'
+  }
+}
+
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
@@ -1062,7 +1107,7 @@ const CHECK_PARTS: Record<Pr['checks'], { text: string; color?: string }> = {
 
 // Every line of the view: each worktree's line, and when open its pull request, its uncommitted files and its commits,
 // each open file's diff under it. `columns` is the width rows are laid out in; `prs` the pull requests by branch.
-const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, diffs: Map<string, Diff>, columns: number, prs: Map<string, Pr>) => {
+const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, diffs: Map<string, Diff>, columns: number, prs: Map<string, Pr>, jobs: Map<string, Job>) => {
   const rows: Row[] = []
   const wanted: Wanted[] = []
   const others = touchedBy(repo)
@@ -1215,6 +1260,10 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
         </Text>
       ),
     })
+    const job = jobs.get(tree.path)
+    if (job) {
+      rows.push({ key: `${key}\tjob`, parent: key, depth: 1, node: <Text color={job.isFailed ? 'red' : 'cyan'} wrap="truncate-end">{job.text}</Text> })
+    }
     if (!open) continue
 
     if (pr) {
@@ -1475,6 +1524,16 @@ const App = ({ root }: { root: string }) => {
   // Whether the repo tab shows an open file or its diff against HEAD.
   const [isDiff, setIsDiff] = useState(false)
   const [notice, setNotice] = useState('')
+  // What kelp is doing to each worktree, by its folder.
+  const [jobs, setJobs] = useState(new Map<string, Job>())
+  const setJob = (path: string, job?: Job) =>
+    setJobs(cur => {
+      const next = new Map(cur)
+      if (job) next.set(path, job)
+      else next.delete(path)
+
+      return next
+    })
   // The footer's question, kept in a ref too so keys typed faster than a redraw all land.
   const [prompt, setPromptState] = useState<Prompt | null>(null)
   const promptRef = useRef<Prompt | null>(null)
@@ -1606,7 +1665,7 @@ const App = ({ root }: { root: string }) => {
   const columns = Math.max(20, size.columns - 3)
   const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
   const { rows, wanted } =
-    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns, prs) : empty
+    tab === 'repo' ? (files ? buildRepoRows(files, isOpen, diffs, isDiff) : empty) : repo ? buildRows(repo, isOpen, diffs, columns, prs, jobs) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
@@ -1727,16 +1786,39 @@ const App = ({ root }: { root: string }) => {
     }
   }
 
-  // Makes a worktree for the branch named and puts the cursor on it.
+  // Makes a worktree for the branch named and puts the cursor on it, then readies it: copies the main worktree's
+  // ignored local files it needs and runs .kelp.json's postCreate commands, saying how far it has got under its line.
   const createTree = async (branch: string) => {
     if (!repo || !branch) return
     const path = newTreePath(repo, branch)
+    const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
     setNotice(`Creating ${branch} at ${shortPath(path)}…`)
     const failed = await addTree(repo, branch, path)
     if (failed) return setNotice(`Couldn't create ${branch}: ${failed}`)
     setCursors(cur => ({ ...cur, worktrees: `tree\t${path}` }))
     refresh.current()
-    setNotice(`Created ${branch} at ${shortPath(path)}`)
+
+    const config = readConfig(main)
+    if (config.error) return setJob(path, { text: config.error, isFailed: true })
+    const files = await localFiles(main, config.copy)
+    const done = [`Created ${branch}`]
+    if (files.length > 0) {
+      setJob(path, { text: `Copying ${files.join(', ')}…` })
+      const why = copyFiles(main, path, files)
+      if (why) return setJob(path, { text: `Couldn't copy the local files: ${why}`, isFailed: true })
+      done.push(`copied ${files.join(', ')}`)
+    }
+    for (const command of config.postCreate) {
+      setJob(path, { text: `Running ${command}…` })
+      const run = await runCommand(path, ['sh', '-c', command])
+      if (run?.code !== 0) {
+        const why = run ? `exit ${run.code}: ${whyFailed(run.err || run.out)}` : "couldn't start"
+        return setJob(path, { text: `${command} failed (${why})`, isFailed: true })
+      }
+      done.push(`ran ${command}`)
+    }
+    setJob(path)
+    setNotice(done.join(', '))
   }
 
   // The path of what the cursor is on: a file (or a line of it), a folder in the repo tab, else its worktree.
