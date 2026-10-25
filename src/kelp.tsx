@@ -1075,8 +1075,9 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
 
   for (const tree of repo.trees) {
     const key = `tree\t${tree.path}`
-    if (rows.length > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
-    const open = isOpen(key, true)
+    // Worktrees start closed, one line each; a blank line sets one apart only after one left open.
+    if (rows.length > 0 && rows[rows.length - 1].depth > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
+    const open = isOpen(key, false)
     const name = label(tree)
     const parts: { text: string; color?: string }[] = []
     const run = runs.get(tree.path)
@@ -1136,7 +1137,6 @@ const buildRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => bool
       key,
       depth: 0,
       canOpen: true,
-      isOpenByDefault: true,
       node: (
         <Text wrap="truncate-end">
           <Text dimColor>{open ? '▾' : '▸'} </Text>
