@@ -35,6 +35,56 @@ const STASH_ENV = {
   GIT_COMMITTER_DATE: '@0 +0000',
 }
 
+// Every key, grouped by area, as `?` lists them. Add a line here for any new key.
+const KEYS: { area: string; keys: [string, string][] }[] = [
+  {
+    area: 'move',
+    keys: [
+      ['↑↓ jk', 'up, down'],
+      ['PgUp PgDn', 'a page up, down (also ctrl+u ctrl+d)'],
+      ['g G', 'top, bottom'],
+      ['wheel', 'scroll'],
+    ],
+  },
+  {
+    area: 'open',
+    keys: [
+      ['⏎ space click', 'open or close'],
+      ['→ l', 'open'],
+      ['← h', 'close, or step out'],
+    ],
+  },
+  {
+    area: 'tabs',
+    keys: [
+      ['tab', 'the other tab'],
+      ['1 2', 'worktrees, repo (or click its name)'],
+    ],
+  },
+  {
+    area: 'files',
+    keys: [
+      ['o', 'open in nvim at the line under the cursor'],
+      ['d', 'repo tab: show files or diffs vs HEAD'],
+    ],
+  },
+  {
+    area: 'merge',
+    keys: [
+      ['u', 'merge the base branch into the worktree (twice)'],
+      ['U', 'abort a merge under way (twice)'],
+    ],
+  },
+  {
+    area: 'kelp',
+    keys: [
+      ['r', 'refresh now'],
+      ['?', 'these keys'],
+      ['q', 'quit'],
+    ],
+  },
+]
+
 // ---- Types ----
 
 // A changed file: its path in the worktree, its line counts, and whether it is new, deleted or binary.
@@ -728,7 +778,7 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
         note(`${view}\tunreadable`, key, depth + 1, `Not shown: binary, over ${MAX_FILE / 1_000_000} MB, or missing.`)
       } else if (isDiff) {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'No changes since the last commit.')
-        rows.push(...diffRows(view, path, shown.lines, depth + 1))
+        rows.push(...diffRows(key, path, shown.lines, depth + 1))
         if (shown.isCut) note(`${view}\tcut`, key, depth + 1, `… diff cut at ${MAX_DIFF_LINES} lines`)
       } else {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'Empty file.')
@@ -786,6 +836,8 @@ const App = ({ root }: { root: string }) => {
     setPromptState(next)
   }
   const [armed, setArmed] = useState<Armed | null>(null)
+  // Whether `?`'s list of keys covers the rows.
+  const [isHelp, setIsHelp] = useState(false)
   // Each tab keeps its own cursor and scroll.
   const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '' })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
@@ -1017,7 +1069,11 @@ const App = ({ root }: { root: string }) => {
     if (promptRef.current) return typeInPrompt(input, key)
     // Any other key lets an armed action go.
     if (armed && input !== armed.input) setArmed(null)
-    if (input === 'q') exit()
+    if (isHelp) {
+      if (input === '?' || input === 'q' || key.escape) setIsHelp(false)
+    }
+    else if (input === '?') setIsHelp(true)
+    else if (input === 'q') exit()
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
     else if (input === 'r') refresh.current()
@@ -1067,15 +1123,34 @@ const App = ({ root }: { root: string }) => {
       {tab === 'repo' && changed > 0 && <Text color="yellow"> · {changed} changed</Text>}
     </Text>
   )
-  const keys =
-    tab === 'repo'
-      ? `↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · r refresh · q quit`
-      : `↑↓ jk move · ⏎ or click open/close · ←→ hl in/out · o nvim · u merge ${repo?.base ?? 'base'} in · U abort · tab repo · r refresh · q quit`
+  // The footer keeps to the keys most wanted here; `?` lists them all.
+  const keys = isHelp
+    ? '? esc close'
+    : tab === 'repo'
+      ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · o nvim · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+  // The width of the widest key, so every area's descriptions line up.
+  const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
+  const help = (
+    <Box flexDirection="row" flexWrap="wrap">
+      {KEYS.map(a => (
+        <Box key={a.area} flexDirection="column" marginRight={4} marginBottom={1}>
+          <Text bold>{a.area}</Text>
+          {a.keys.map(([k, what]) => (
+            <Text key={k} wrap="truncate-end">
+              <Text color="blue">{k.padEnd(keyWidth)}</Text>  <Text dimColor>{what}</Text>
+            </Text>
+          ))}
+        </Box>
+      ))}
+    </Box>
+  )
 
   return (
     <Box flexDirection="column" height={size.rows - 1}>
       {header}
-      <Box flexDirection="column" flexGrow={1}>
+      {isHelp && <Box flexDirection="column" flexGrow={1}>{help}</Box>}
+      <Box flexDirection="column" flexGrow={1} display={isHelp ? 'none' : 'flex'}>
         {tab === 'worktrees' && repo === undefined && <Text dimColor>Reading worktrees…</Text>}
         {tab === 'worktrees' && repo === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
         {tab === 'repo' && files === undefined && <Text dimColor>Listing the repository…</Text>}

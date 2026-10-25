@@ -18,6 +18,6 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **repo**: a second tab with the file tree of the worktree kelp runs in; open a file to read it, or press `d` to see its diff against HEAD instead. Changed files and the folders holding them are marked
 
-Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `u` merge the base in, `U` abort a merge, `r` refresh, `q` quit.
+Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `u` merge the base in, `U` abort a merge, `r` refresh, `?` list every key, `q` quit.
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.
