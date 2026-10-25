@@ -109,6 +109,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['c', 'commit everything in the worktree, asking for the message'],
       ['D', "discard an uncommitted file's changes (twice)"],
+      ['y', 'copy the path of the file or worktree'],
     ],
   },
   {
@@ -581,6 +582,29 @@ const openInNvim = async (file: string, line: number) => {
   }
 
   return `Couldn't open ${shortPath(file)} in nvim`
+}
+
+// ---- Clipboard and editor ----
+
+// Feeds `text` to a command's input; whether it ran and exited cleanly.
+const pipeTo = async (command: string[], text: string) => {
+  try {
+    const proc = Bun.spawn(command, { stdin: new TextEncoder().encode(text), stdout: 'ignore', stderr: 'ignore' })
+
+    return (await proc.exited) === 0
+  } catch {
+    return false
+  }
+}
+
+// Puts `text` on the clipboard: by OSC 52, which the terminal acts on even through ssh, and inside tmux
+// through tmux's own buffer too (-w hands it on to the outer terminal). Failing both, wl-copy or xclip.
+const copyText = async (text: string) => {
+  process.stdout.write(`\x1b]52;c;${Buffer.from(text).toString('base64')}\x07`)
+  const isInTmux = Boolean(process.env.TMUX) && (await pipeTo(['tmux', 'load-buffer', '-w', '-'], text))
+  if (isInTmux) return
+  if (process.env.WAYLAND_DISPLAY && (await pipeTo(['wl-copy'], text))) return
+  if (process.env.DISPLAY) await pipeTo(['xclip', '-selection', 'clipboard'], text)
 }
 
 // ---- Agents and tmux ----
@@ -1675,6 +1699,21 @@ const App = ({ root }: { root: string }) => {
     setNotice(`Created ${branch} at ${shortPath(path)}`)
   }
 
+  // The path of what the cursor is on: a file (or a line of it), a folder in the repo tab, else its worktree.
+  const pathUnder = () => {
+    if (row?.file) return row.file
+    if (tab === 'repo' && files) return row?.key.startsWith('dir\t') ? `${files.dir}/${row.key.slice(4)}` : files.dir
+    return treeUnder()?.path
+  }
+
+  // Copies the path under the cursor to the clipboard and says what it copied.
+  const copyPath = async () => {
+    const path = pathUnder()
+    if (!path) return setNotice('Nothing here to copy.')
+    await copyText(path)
+    setNotice(`Copied ${path} to the clipboard.`)
+  }
+
   // The uncommitted file the cursor is on or in the diff of: its worktree's folder, its path there, and whether git tracks it.
   const uncommittedUnder = () => {
     const at = row && (row.canOpen ? row : parentOf(row))
@@ -1820,6 +1859,7 @@ const App = ({ root }: { root: string }) => {
         refresh.current()
       })
     }
+    else if (input === 'y') copyPath()
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()

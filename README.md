@@ -22,6 +22,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **committing**: `c` asks for a message in the footer and commits everything uncommitted in the worktree under the cursor, untracked files included
 - **discarding**: `D` (twice) on an uncommitted file throws its changes away: a tracked file goes back to its last commit, an untracked one is deleted
 - **tmux**: inside tmux, the panes whose folder is in each worktree and what they run. `t` jumps to the worktree: to its tmux pane when it has one, else to a new tmux window there named after its branch, or outside tmux a new kitty window
+- **copying**: `y` copies the path of the file or worktree under the cursor, by OSC 52 so it works through tmux and ssh, else with wl-copy or xclip
 - **shared files**: a file changed in more than one worktree says which others change it too
 - **new worktrees**: `n` asks for a branch name and makes a worktree for it: the branch when it exists, here or on origin, else a new one from the base. It goes beside the other worktrees when they share a folder, else next to the repository as `<repo>-<branch>`
 - **repo**: a second tab with the file tree of the worktree kelp runs in; open a file to read it, or press `d` to see its diff against HEAD instead. Changed files and the folders holding them are marked
@@ -35,6 +36,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `d` file or diff (repo tab)
 - `o` open in nvim at the line under the cursor
 - `t` jump to the worktree in tmux, or open a window there
+- `t` jump to the worktree in tmux
 - `n` new worktree
 - `u` merge the base in
 - `m` merge into the base
@@ -42,6 +44,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `!` run a command in the worktree
 - `c` commit everything in the worktree
 - `D` (twice) discard a file's changes
+- `y` copy the path of the file or worktree
 - `r` refresh
 - `?` list every key
 - `q` quit
