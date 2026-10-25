@@ -129,6 +129,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['a', 'start claude in the worktree, in a new window'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
+      ['>', "reply: type a message into the worktree's claude, in its tmux pane"],
     ],
   },
   {
@@ -240,8 +241,8 @@ type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean;
 // How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working.
 type Ending = { kind: 'done' | 'tool' | 'stopped' | 'working'; at: number; tool?: string; says: string }
 
-// A tmux pane: its id, its window as "session:index", that window's name, and what it runs.
-type Pane = { id: string; window: string; windowName: string; command: string }
+// A tmux pane: its id, its window as "session:index", that window's name, what it runs, and its first process.
+type Pane = { id: string; window: string; windowName: string; command: string; pid: number }
 
 // `remote` is the one to push to ('' when there is none), `github` its page on GitHub ('' when it is not there).
 type Repo = { dir: string; base: string; remote: string; github: string; trees: Tree[] }
@@ -921,6 +922,15 @@ const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaitin
   return isRunning ? { isBusy: true } : { isBusy: false, isWaiting: true, says: ending.says }
 }
 
+// A process's parent, or 0 when it is gone. The parent's pid is the second field after the name, which ends at the last ")".
+const parentPid = (pid: number) => {
+  try {
+    return Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop()!.split(' ')[1])
+  } catch {
+    return 0
+  }
+}
+
 // Every coding agent running and the folder it runs in, read from /proc; none where there is no /proc.
 // An agent started by another of its kind, such as a helper process, is left out.
 const findAgents = () => {
@@ -934,10 +944,7 @@ const findAgents = () => {
     const name = agentOf(pid)
     if (!name) return []
     try {
-      // The parent's pid is the second field after the name, which ends at the last ")".
-      const parent = Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop()!.split(' ')[1])
-
-      return [{ name, pid: Number(pid), parent, cwd: readlinkSync(`/proc/${pid}/cwd`) }]
+      return [{ name, pid: Number(pid), parent: parentPid(Number(pid)), cwd: readlinkSync(`/proc/${pid}/cwd`) }]
     } catch {
       return []
     }
@@ -953,7 +960,7 @@ const findAgents = () => {
 const listPanes = async () => {
   if (!process.env.TMUX) return []
   try {
-    const format = ['#{pane_id}', '#{session_name}:#{window_index}', '#{window_name}', '#{pane_current_command}', '#{pane_current_path}'].join('\t')
+    const format = ['#{pane_id}', '#{session_name}:#{window_index}', '#{window_name}', '#{pane_current_command}', '#{pane_current_path}', '#{pane_pid}'].join('\t')
     const proc = Bun.spawn(['tmux', 'list-panes', '-a', '-F', format], { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' })
     const out = await new Response(proc.stdout).text()
     if ((await proc.exited) !== 0) return []
@@ -961,8 +968,8 @@ const listPanes = async () => {
     return out
       .split('\n')
       .map(line => line.split('\t'))
-      .filter(f => f.length === 5 && f[0] !== process.env.TMUX_PANE)
-      .map(([id, window, windowName, command, path]) => ({ id, window, windowName, command, path }))
+      .filter(f => f.length === 6 && f[0] !== process.env.TMUX_PANE)
+      .map(([id, window, windowName, command, path, pid]) => ({ id, window, windowName, command, path, pid: Number(pid) }))
   } catch {
     return []
   }
@@ -1006,6 +1013,25 @@ const startClaude = async (path: string, branch: string, prompt = '') => {
   const where = await openWindow(path, name, prompt ? ['claude', prompt] : ['claude'])
 
   return where ? `Started claude in ${branch}, in ${where} "${name}"` : `Couldn't start claude in ${shortPath(path)}`
+}
+
+// The tmux pane a process runs in: the pane whose first process it is, or descends from.
+const paneOf = (panes: Pane[], pid: number) => {
+  for (let p = pid; p > 1; p = parentPid(p)) {
+    const pane = panes.find(x => x.pid === p)
+    if (pane) return pane
+  }
+
+  return undefined
+}
+
+// Types `text` into a tmux pane and presses Enter, as if typed there. Enter waits a moment, so an agent
+// takes the text as typed rather than as a paste still coming in, where Enter would only start a new line. Whether it went.
+const typeInto = async (pane: Pane, text: string) => {
+  if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, '-l', '--', text]))) return false
+  await Bun.sleep(150)
+
+  return succeeds(['tmux', 'send-keys', '-t', pane.id, 'Enter'])
 }
 
 // ---- Ports ----
@@ -2404,6 +2430,27 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setNotice(`◆ ${agent.name} in ${label(next)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''} · A again for its tmux pane`)
   }
 
+  // `>`: asks for a message and types it into the tmux pane of the worktree's claude, the one waiting for the person
+  // first, else an idle one, else one at work, which takes it once its turn is done. Says why when there is no pane to send to.
+  const reply = () => {
+    const tree = treeUnder()
+    if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
+    const name = label(tree)
+    const claudes = tree.agents.filter(a => a.name === 'claude')
+    const agent = claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
+    if (!agent) return setNotice(`No claude runs in ${name}, so there is nothing to send to: a starts one.`)
+    if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to claude in ${name} through.`)
+    const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
+    if (!pane) return setNotice(`claude in ${name} runs in no tmux pane kelp can see, so there is nowhere to send to.`)
+    const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
+    ask(`reply to claude in ${name} (${state}):`, async text => {
+      if (!text) return
+      const isSent = await typeInto(pane, text)
+      setNotice(isSent ? `Sent to claude in ${name}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
+      refresh.current()
+    })
+  }
+
   // The worktree under the cursor, or in the repo tab the one it explores.
   const treeUnder = () =>
     tab === 'repo' ? (repo && files ? treeAt(repo.trees, files.dir) : undefined) : repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
@@ -2864,6 +2911,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'D') discard()
     else if (input === '+' || input === '-') stage(input === '+')
     else if (input === 'A') nextWaiting()
+    else if (input === '>') reply()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
       if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree.path, label(tree))).then(text => {
@@ -2978,11 +3026,13 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const cursorTree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
+  // Answering is offered where a claude waits for the person.
+  const replyKey = treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting) ? ' · > reply' : ''
   const keys = isHelp
     ? '? esc close'
     : tab === 'repo'
       ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · ${find} · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+      : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
