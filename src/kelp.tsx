@@ -1789,13 +1789,8 @@ const App = ({ root }: { root: string }) => {
     setPrompt({ ...p, text: p.text + input.replace(/[\r\n\t]/g, '') })
   }
 
-  // The worktree the cursor is in: in the repo tab the one explored, else the one whose lines it is on.
-  const treeAtCursor = () => {
-    if (tab === 'repo') return files?.dir
-    const [kind, path] = (row?.key ?? '').split('\t')
-
-    return kind === 'tree' ? path : undefined
-  }
+  // The folder of the worktree under the cursor, or in the repo tab the one it explores.
+  const treeAtCursor = () => treeUnder()?.path ?? (tab === 'repo' ? files?.dir : undefined)
   const treeName = (path: string) => {
     const tree = repo?.trees.find(t => t.path === path)
 
