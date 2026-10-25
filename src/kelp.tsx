@@ -113,6 +113,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['m', 'merge the worktree\'s branch into the base branch (twice)'],
       ['R', 'rebase the worktree onto the base branch (twice)'],
       ['U', 'abort a merge or rebase under way (twice)'],
+      ['S', 'sync every worktree with the base branch, skipping any it can\'t do safely (twice)'],
     ],
   },
   {
@@ -1714,6 +1715,31 @@ const planFor = (action: Action, tree: Tree, repo: Repo): Step | string => {
   }
 }
 
+// What S does: brings every worktree behind the base up to it, leaving alone any it can't do safely. One with no commits
+// of its own fast-forwards; one with commits gets the base merged in when merge-tree sees no conflict. One with
+// uncommitted changes, in the middle of a merge or rebase, or that would conflict is skipped, with why.
+type Sync = { tree: Tree; isFastForward: boolean }
+
+const planSync = (repo: Repo) => {
+  const syncs: Sync[] = []
+  const skipped: string[] = []
+  for (const tree of repo.trees.filter(t => !t.isBase && t.behind > 0)) {
+    const why = tree.isMerging
+      ? 'merging'
+      : tree.isRebasing
+        ? 'rebasing'
+        : tree.uncommitted.length > 0
+          ? 'uncommitted'
+          : tree.conflicts.length > 0
+            ? 'conflicts'
+            : ''
+    if (why) skipped.push(`${label(tree)}: ${why}`)
+    else syncs.push({ tree, isFastForward: tree.ahead === 0 })
+  }
+
+  return { syncs, skipped }
+}
+
 // ---- Saved state ----
 
 // Where kelp remembers the repository holding `root`: ~/.cache/kelp/<hash>.json, the hash of git's own folder,
@@ -2083,6 +2109,42 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
+  // Syncs every worktree with the base on a second press of S, one at a time, then says in one line what came of it.
+  // A merge that conflicts after all, though merge-tree saw none, is aborted, so a sync never leaves one half done.
+  const syncAll = () => {
+    if (!repo) return
+    const base = repo.base
+    const { syncs, skipped } = planSync(repo)
+    const skips = skipped.length > 0 ? `skipped ${skipped.length} (${skipped.join(', ')})` : ''
+    if (syncs.length === 0) return setNotice(skips ? `Nothing to sync safely: ${skips}.` : `Every worktree already has everything in ${base}.`)
+    const forwards = syncs.filter(s => s.isFastForward).length
+    const plan = [forwards > 0 && `fast-forward ${forwards}`, syncs.length > forwards && `merge ${base} into ${syncs.length - forwards}`, skipped.length > 0 && `skip ${skipped.length}`]
+
+    confirm('S', `Sync every worktree with ${base}: ${plan.filter(Boolean).join(', ')}`, async () => {
+      setNotice(`Syncing ${syncs.length} worktree${syncs.length === 1 ? '' : 's'} with ${base}…`)
+      let forwarded = 0
+      let merged = 0
+      const failed: string[] = []
+      for (const { tree, isFastForward } of syncs) {
+        const run = await gitRun(tree.path, isFastForward ? ['merge', '--ff-only', base] : ['merge', '--no-edit', base], { GIT_EDITOR: 'true' })
+        if (run?.code === 0 && isFastForward) forwarded++
+        else if (run?.code === 0) merged++
+        else {
+          if (!isFastForward) await gitRun(tree.path, ['merge', '--abort'])
+          failed.push(label(tree))
+        }
+      }
+      await refresh.current()
+      const how = [forwarded > 0 && `fast-forwarded ${forwarded}`, merged > 0 && `merged ${base} into ${merged}`].filter(Boolean).join(', ')
+      const said = [
+        forwarded + merged > 0 && `Synced ${forwarded + merged} with ${base} (${how})`,
+        skips,
+        failed.length > 0 && `${failed.length} failed and left as it was (${failed.join(', ')})`,
+      ]
+      setNotice(`${said.filter(Boolean).join(', ')}.`.replace(/^./, c => c.toUpperCase()))
+    })
+  }
+
   // Asks `label` in the footer, then calls `onDone` with the answer, unless esc is pressed.
   const ask = (label: string, onDone: (answer: string) => void, text = '', more: Pick<Prompt, 'onChange' | 'onCancel'> = {}) =>
     setPrompt({ label, text, onDone, ...more })
@@ -2351,6 +2413,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
     else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
     else if (input === 'R' && tab === 'worktrees') act('rebase')
+    else if (input === 'S' && tab === 'worktrees') syncAll()
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()
