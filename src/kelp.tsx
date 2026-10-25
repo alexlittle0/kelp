@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, cpSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
@@ -55,6 +55,14 @@ const FETCH_ENV: Record<string, string> = {
 const AGENTS = ['claude', 'codex', 'aider', 'gemini', 'opencode', 'cursor-agent']
 // A claude counts as busy while its transcript was written this recently.
 const BUSY_MS = 30_000
+// A claude whose tool call has waited this long with nothing running for it is asking leave to run it.
+const ASKING_MS = 5000
+// A claude done with its turn counts as waiting for this long, then only as idle.
+const WAITING_MS = 60 * 60_000
+// How much of the end of a claude transcript is read.
+const TRANSCRIPT_TAIL = 256 * 1024
+// Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
+const LONG_TOOLS = ['Agent', 'Task', 'WebFetch', 'WebSearch']
 
 // Every key, grouped by area, as `?` lists them. Add a line here for any new key.
 const KEYS: { area: string; keys: [string, string][] }[] = [
@@ -204,8 +212,12 @@ type Tree = {
   isUpstreamGone: boolean
 }
 
-// A coding agent running in a worktree; `isBusy` is known only for claude, from its transcript.
-type Agent = { name: string; pid: number; isBusy?: boolean }
+// A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
+// for the person (its turn done, or asking leave to run a tool), and what it last said or asks to run.
+type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; says?: string }
+
+// How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working.
+type Ending = { kind: 'done' | 'tool' | 'stopped' | 'working'; at: number; tool?: string; says: string }
 
 // A tmux pane: its id, its window as "session:index", that window's name, and what it runs.
 type Pane = { id: string; window: string; windowName: string; command: string }
@@ -727,15 +739,133 @@ const agentOf = (pid: string) => {
   }
 }
 
-// Whether a claude running in `cwd` wrote to one of its transcripts within BUSY_MS.
+// The newest transcript of a claude running in `cwd` and when it was written, or null.
 // Claude keeps them in ~/.claude/projects/<cwd with all but letters and digits made "-">/.
-const isClaudeBusy = (cwd: string) => {
+const newestTranscript = (cwd: string) => {
   const dir = `${homedir()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}`
   try {
-    return readdirSync(dir).some(f => f.endsWith('.jsonl') && Date.now() - modifiedAt(`${dir}/${f}`) < BUSY_MS)
+    return readdirSync(dir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => ({ file: `${dir}/${f}`, at: modifiedAt(`${dir}/${f}`) }))
+      .reduce<{ file: string; at: number } | null>((best, t) => (!best || t.at > best.at ? t : best), null)
+  } catch {
+    return null
+  }
+}
+
+// Each transcript's ending, kept while the file is unchanged, so only a changed one is read again.
+const endings = new Map<string, { at: number; ending: Ending | null }>()
+
+// The last bytes of a file, from the start of a line on.
+const readTail = (file: string, bytes: number) => {
+  const fd = openSync(file, 'r')
+  try {
+    const size = fstatSync(fd).size
+    const length = Math.min(size, bytes)
+    const buffer = Buffer.alloc(length)
+    readSync(fd, buffer, 0, length, size - length)
+    const text = buffer.toString('utf8')
+
+    return length < size ? text.slice(text.indexOf('\n') + 1) : text
+  } catch {
+    return ''
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// What a tool call is about: its command, file, address or description.
+const toolSubject = (input: Record<string, unknown> = {}) =>
+  String(input.command ?? input.file_path ?? input.notebook_path ?? input.url ?? input.pattern ?? input.description ?? '')
+
+// How the transcript ends, from its last conversation entry; `at` is the transcript's time, when it last changed.
+const readEnding = (file: string, at: number): Ending | null => {
+  const cached = endings.get(file)
+  if (cached?.at === at) return cached.ending
+  type Entry = { type?: string; isMeta?: boolean; timestamp?: string; message?: { stop_reason?: string; content?: unknown } }
+  let entries: Entry[] = []
+  try {
+    entries = readTail(file, TRANSCRIPT_TAIL).split('\n').flatMap(line => {
+      try {
+        return [JSON.parse(line) as Entry]
+      } catch {
+        return []
+      }
+    })
+  } catch {
+    // Gone, or unreadable.
+  }
+  const blocks = (e: Entry) => (Array.isArray(e.message?.content) ? e.message.content : [{ type: 'text', text: e.message?.content }]) as { type: string; text?: string; name?: string; input?: Record<string, unknown> }[]
+  const conversation = entries.filter(e => e.type === 'assistant' || (e.type === 'user' && !e.isMeta))
+  const last = conversation.at(-1)
+  // What it said last, in one line.
+  const said = conversation.findLast(e => e.type === 'assistant' && blocks(e).some(b => b.type === 'text' && b.text?.trim()))
+  const says = (said ? blocks(said).filter(b => b.type === 'text').map(b => b.text).join(' ') : '').replace(/\s+/g, ' ').trim()
+  let ending: Ending | null = null
+  if (last) {
+    const when = Date.parse(last.timestamp ?? '') || at
+    const tool = last.type === 'assistant' ? blocks(last).findLast(b => b.type === 'tool_use') : undefined
+    const text = blocks(last).find(b => b.type === 'text')?.text ?? ''
+    if (tool) ending = { kind: 'tool', at: when, tool: tool.name, says: `wants ${tool.name}: ${toolSubject(tool.input)}`.replace(/\s+/g, ' ').trim() }
+    else if (last.type === 'assistant' && last.message?.stop_reason && last.message.stop_reason !== 'tool_use') ending = { kind: 'done', at: when, says }
+    else if (last.type === 'user' && text.startsWith('[Request interrupted')) ending = { kind: 'stopped', at: when, says }
+    else ending = { kind: 'working', at: when, says }
+  }
+  endings.set(file, { at, ending })
+
+  return ending
+}
+
+// When the machine started, ms since the epoch, which /proc's process start times count from.
+let bootedAt = 0
+const bootTime = () => {
+  if (!bootedAt) {
+    try {
+      bootedAt = Number(readFileSync('/proc/stat', 'utf8').match(/^btime (\d+)/m)?.[1] ?? 0) * 1000
+    } catch {
+      // No /proc.
+    }
+  }
+
+  return bootedAt
+}
+
+// Whether process `pid` has a child started since `since`, ms since the epoch, such as the shell of a tool it runs.
+// A process's start is the 22nd field of its stat, in hundredths of a second since boot.
+const hasChildSince = (pid: number, since: number) => {
+  try {
+    return readdirSync('/proc').some(p => {
+      if (!/^\d+$/.test(p)) return false
+      try {
+        const fields = readFileSync(`/proc/${p}/stat`, 'utf8').split(') ').pop()!.split(' ')
+        return Number(fields[1]) === pid && bootTime() + Number(fields[19]) * 10 >= since - 2000
+      } catch {
+        return false
+      }
+    })
   } catch {
     return false
   }
+}
+
+// What a claude in `cwd` is up to, from how its newest transcript ends.
+const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'says'> => {
+  const transcript = newestTranscript(cwd)
+  if (!transcript) return { isBusy: false }
+  const ending = readEnding(transcript.file, transcript.at)
+  const quiet = Date.now() - transcript.at
+  const isRecent = quiet < BUSY_MS
+  if (!ending) return { isBusy: isRecent }
+  if (ending.kind === 'done') {
+    const isWaiting = Date.now() - ending.at < WAITING_MS
+    return { isBusy: false, isWaiting, says: ending.says || undefined }
+  }
+  if (ending.kind === 'stopped') return { isBusy: false, says: ending.says || undefined }
+  if (ending.kind === 'working') return { isBusy: isRecent }
+  // A tool call: running, unless it has sat a while with nothing started for it, as it waits for leave to run.
+  const isRunning = quiet < ASKING_MS || LONG_TOOLS.includes(ending.tool ?? '') || ending.tool?.startsWith('mcp__') || hasChildSince(pid, ending.at)
+
+  return isRunning ? { isBusy: true } : { isBusy: false, isWaiting: true, says: ending.says }
 }
 
 // Every coding agent running and the folder it runs in, read from /proc; none where there is no /proc.
@@ -760,16 +890,10 @@ const findAgents = () => {
     }
   })
   const ids = new Set(found.map(a => a.pid))
-  const busy = new Map<string, boolean>()
 
   return found
     .filter(a => !ids.has(a.parent))
-    .map(({ name, pid, cwd }): Agent & { cwd: string } => {
-      if (name !== 'claude') return { name, pid, cwd }
-      if (!busy.has(cwd)) busy.set(cwd, isClaudeBusy(cwd))
-
-      return { name, pid, cwd, isBusy: busy.get(cwd) }
-    })
+    .map(({ name, pid, cwd }): Agent & { cwd: string } => (name === 'claude' ? { name, pid, cwd, ...claudeState(pid, cwd) } : { name, pid, cwd }))
 }
 
 // Every tmux pane but kelp's own and the folder it is in, when kelp runs inside tmux.
@@ -1419,10 +1543,12 @@ const buildRows = (
       if (isRunning(run) || run.code !== 0) parts.push({ text: `${state.mark} ${what}`, color: state.color })
       if (isRunning(run) && run.url) details.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
-    // Its agents: a busy one on the line, the idle ones in the details.
-    const busy = tree.agents.filter(a => a.isBusy !== false)
-    const idle = tree.agents.filter(a => a.isBusy === false)
+    // Its agents: one waiting for the person and a busy one on the line, the idle ones in the details.
+    const waiting = tree.agents.filter(a => a.isWaiting)
+    const busy = tree.agents.filter(a => a.isBusy !== false && !a.isWaiting)
+    const idle = tree.agents.filter(a => a.isBusy === false && !a.isWaiting)
     const names = (agents: Agent[]) => [...new Set(agents.map(a => a.name))].join(', ')
+    if (waiting.length > 0) parts.push({ text: `◆ ${names(waiting)} waiting`, color: 'yellow' })
     if (busy.length > 0) parts.push({ text: `● ${names(busy)}`, color: 'green' })
     if (idle.length > 0) details.push({ text: `○ ${names(idle)} idle` })
     if (tree.uncommitted.length > 0) parts.push({ text: `● ${tree.uncommitted.length}`, color: 'yellow' })
