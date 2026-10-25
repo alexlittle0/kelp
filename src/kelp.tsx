@@ -182,6 +182,10 @@ type Tree = {
   isBase: boolean
   // The repository's first worktree, which git cannot remove.
   isMain: boolean
+  // Its folder is gone, so `git worktree prune` would drop it; locked, it is kept from being pruned or removed.
+  isMissing: boolean
+  isLocked: boolean
+  lockReason: string
   ahead: number
   behind: number
   // Whether its branch is fully in the base after commits of its own, so it is safe to remove;
@@ -320,7 +324,8 @@ const findRepo = async (dir: string) => {
   return null
 }
 
-// The worktrees git knows of, leaving out bare ones and those whose folder is gone. Git lists the main one first.
+// The worktrees git knows of, leaving out bare ones, with whether each one's folder is gone and whether it is locked,
+// and why when the lock says. Git lists the main one first.
 const listWorktrees = async (dir: string) => {
   const text = (await git(dir, ['worktree', 'list', '--porcelain'])) ?? ''
 
@@ -329,10 +334,20 @@ const listWorktrees = async (dir: string) => {
     .map((block, n) => {
       const lines = block.split('\n')
       const value = (name: string) => lines.find(l => l.startsWith(`${name} `))?.slice(name.length + 1) ?? ''
+      const path = value('worktree')
 
-      return { path: value('worktree'), head: value('HEAD'), branch: value('branch').replace(/^refs\/heads\//, ''), isMain: n === 0, isBare: lines.includes('bare') }
+      return {
+        path,
+        head: value('HEAD'),
+        branch: value('branch').replace(/^refs\/heads\//, ''),
+        isMain: n === 0,
+        isMissing: !existsSync(path),
+        isLocked: lines.some(l => l === 'locked' || l.startsWith('locked ')),
+        lockReason: value('locked'),
+        isBare: lines.includes('bare'),
+      }
     })
-    .filter(w => w.path && !w.isBare && existsSync(w.path))
+    .filter(w => w.path && !w.isBare)
 }
 
 // The branch the others are compared with: origin's default, else main, else master, else the first worktree's.
@@ -491,7 +506,11 @@ const readRebase = async (path: string) => {
   return null
 }
 
-const loadTree = async (w: { path: string; head: string; branch: string; isMain: boolean }, base: string, upstreams: Upstreams): Promise<Tree> => {
+const loadTree = async (
+  w: { path: string; head: string; branch: string; isMain: boolean; isMissing: boolean; isLocked: boolean; lockReason: string },
+  base: string,
+  upstreams: Upstreams,
+): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
   const [log, counts, uncommitted, headAt, mergeHead, rebase] = await Promise.all([
@@ -1235,6 +1254,8 @@ const planRemoval = (tree: Tree, repo: Repo, root: string, isForce: boolean) => 
   const name = label(tree)
   if (tree.isMain) return `${name} is the main worktree, which git can't remove.`
   if (tree.isBase) return `${name} has the base branch checked out.`
+  if (tree.isMissing) return `${name}'s folder is gone: C prunes it.`
+  if (tree.isLocked) return `${name} is locked${tree.lockReason ? ` (${tree.lockReason})` : ''}: git worktree unlock it first.`
   if (root === tree.path || root.startsWith(`${tree.path}/`)) return `kelp is running in ${name}.`
   if (tree.agents.length > 0) return `${[...new Set(tree.agents.map(a => a.name))].join(', ')} is running in ${name}: stop it first.`
   const n = tree.uncommitted.length
@@ -1524,6 +1545,12 @@ const buildRows = (
     } else if (tree.conflicts.length > 0) {
       parts.push({ text: `⚠ ${tree.conflicts.length} conflict${tree.conflicts.length === 1 ? '' : 's'}`, color: 'red' })
     } else if (tree.merged) details.push({ text: `merges ${repo.base} in cleanly` })
+    // A worktree whose folder is gone wants pruning; a lock only wants knowing about.
+    if (tree.isMissing) {
+      parts.push({ text: 'missing', color: 'red' })
+      details.push({ text: tree.isLocked ? 'folder gone, locked so C keeps it' : 'folder gone, C prunes it', color: 'red' })
+    }
+    if (tree.isLocked) details.push({ text: `locked${tree.lockReason ? `: ${tree.lockReason}` : ''}` })
     if (tree.isUpstreamGone) parts.push({ text: 'upstream gone', color: 'red' })
     // Its pull request: failing checks or asked-for changes on the line, the rest in the details.
     const pr = tree.isBase ? undefined : prs.get(tree.branch)
