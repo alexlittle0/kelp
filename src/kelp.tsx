@@ -66,6 +66,8 @@ const WAITING_MS = 60 * 60_000
 // A claude whose transcript ends on a prompt or a tool's result is waiting on its model, quietly while it thinks;
 // past this long something went wrong, and it counts as idle.
 const THINKING_MS = 10 * 60_000
+// Attempts `N` makes at once at most, with a branch such as fix-login*3.
+const MAX_ATTEMPTS = 9
 // How soon a second `A` must follow the first to go on to the worktree's tmux pane.
 const AGAIN_MS = 2000
 // How much of the end of a claude transcript is read.
@@ -131,9 +133,9 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['t', 'jump to the worktree: its tmux pane, else a new window there'],
       ['a', 'start claude in the worktree, in a new window'],
-      ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt'],
+      ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it"],
+      ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
     ],
   },
   {
@@ -248,9 +250,9 @@ type Tree = {
 }
 
 // A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
-// for the person (its turn done, or asking leave to run a tool), what it last said or asks to run,
+// for the person (its turn done, or with `isAsking` asking leave to run a tool), what it last said or asks to run,
 // and while busy when its turn began, ms since the epoch.
-type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; says?: string; turnAt?: number }
+type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number }
 
 // How a claude transcript ends: its turn done, a tool call not yet answered, stopped by the person, or still working;
 // `turnAt` when the person last prompted it, 0 when that is not in the part read.
@@ -1008,7 +1010,7 @@ const hasChildSince = (pid: number, since: number) => {
 }
 
 // What a claude in `cwd` is up to, from how its newest transcript ends.
-const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'says' | 'turnAt'> => {
+const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'isAsking' | 'says' | 'turnAt'> => {
   const transcript = newestTranscript(cwd)
   if (!transcript) return { isBusy: false }
   const ending = readEnding(transcript.file, transcript.at)
@@ -1025,7 +1027,7 @@ const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaitin
   // A tool call: running, unless it has sat a while with nothing started for it, as it waits for leave to run.
   const isRunning = quiet < ASKING_MS || LONG_TOOLS.includes(ending.tool ?? '') || ending.tool?.startsWith('mcp__') || hasChildSince(pid, ending.at)
 
-  return isRunning ? { isBusy: true, turnAt } : { isBusy: false, isWaiting: true, says: ending.says }
+  return isRunning ? { isBusy: true, turnAt } : { isBusy: false, isWaiting: true, isAsking: true, says: ending.says }
 }
 
 // A process's parent, or 0 when it is gone. The parent's pid is the second field after the name, which ends at the last ")".
@@ -1139,6 +1141,25 @@ const typeInto = async (pane: Pane, text: string) => {
   await Bun.sleep(150)
 
   return succeeds(['tmux', 'send-keys', '-t', pane.id, 'Enter'])
+}
+
+// Whether a tmux pane shows claude's menu asking leave to run a tool, its first choice "1. Yes". Claude writes
+// the tool call to its transcript only once it is answered, so the transcript alone can't always tell.
+const isAskingIn = async (pane: Pane) => {
+  const run = await runCommand(homedir(), ['tmux', 'capture-pane', '-p', '-t', pane.id])
+
+  return run?.code === 0 && /^\s*❯ 1\. Yes\b/m.test(run.out)
+}
+
+// Answers claude's menu asking leave to run a tool: 1 picks its first choice, "Yes"; esc says no, as the number
+// of "No" changes from one menu to another. Words given with a no are then typed in, as what to do instead. Whether it went.
+const answerAsking = async (pane: Pane, isAllowed: boolean, instead = '') => {
+  if (isAllowed) return succeeds(['tmux', 'send-keys', '-t', pane.id, '1'])
+  if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, 'Escape']))) return false
+  if (!instead) return true
+  await Bun.sleep(500)
+
+  return typeInto(pane, instead)
 }
 
 // ---- Ports ----
@@ -2835,7 +2856,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // `>`: asks for a message and types it into the tmux pane of the worktree's claude, the one waiting for the person
   // first, else an idle one, else one at work, which takes it once its turn is done. Says why when there is no pane to send to.
   // On a line of a diff or file it asks for a review note instead, sent as "<file>:<line>: <note>".
-  const reply = () => {
+  const reply = async () => {
     const tree = treeUnder()
     if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
     const name = label(tree)
@@ -2848,6 +2869,18 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
     // A line under a file, not the file's own line, which opens and closes.
     const at = row?.file && !row.canOpen && row.file.startsWith(`${tree.path}/`) ? `${row.file.slice(tree.path.length + 1)}:${row.line ?? 1}` : ''
+    // Asking leave to run a tool, its menu wants yes or no, not free text; a note goes with a no.
+    if (agent.isAsking || (await isAskingIn(pane))) {
+      const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
+      return ask(`claude in ${name} asks to run ${asks.length > 50 ? `${asks.slice(0, 49)}…` : asks} · allow? y/n, or n and what to do instead:`, async answer => {
+        const no = answer.match(/^no?(?:\s+|$)(.*)$/i)
+        if (!/^y(es)?$/i.test(answer) && !no) return setNotice('Nothing sent: answer y or n.')
+        const instead = no?.[1] && at ? `${at}: ${no[1]}` : (no?.[1] ?? '')
+        const isSent = await answerAsking(pane, !no, instead)
+        setNotice(!isSent ? `Couldn't send keys to tmux pane ${pane.id}.` : no ? `Told claude in ${name} no${instead ? ', and what to do instead' : ''}.` : `Allowed claude in ${name} to run ${asks}.`)
+        refresh.current()
+      })
+    }
     ask(at ? `note on ${at} for claude in ${name} (${state}):` : `reply to claude in ${name} (${state}):`, async text => {
       if (!text) return
       const isSent = await typeInto(pane, at ? `${at}: ${text}` : text)
@@ -3046,16 +3079,27 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   }
 
   // N: asks for a branch, then for what claude should do there; makes the worktree as `n` does,
-  // then starts claude in it with that prompt, once the worktree is readied.
+  // then starts claude in it with that prompt, once the worktree is readied. A branch ending in *3, such as
+  // fix-login*3, makes several attempts at once: fix-login-1 to fix-login-3, each with claude on the same prompt.
   const newTask = () =>
-    ask('new task on branch', branch => {
-      if (!branch) return
-      ask(`task for claude in ${branch}:`, async task => {
+    ask('new task on branch (name*3 for 3 attempts)', answer => {
+      if (!answer) return
+      const many = answer.match(/^(.+)\*(\d+)$/)
+      const count = many ? Number(many[2]) : 1
+      if (count < 1 || count > MAX_ATTEMPTS) return setNotice(`Between 1 and ${MAX_ATTEMPTS} attempts at once.`)
+      const branches = many ? Array.from({ length: count }, (_, k) => `${many[1]}-${k + 1}`) : [answer]
+      ask(`task for claude in ${many ? `${branches[0]} to ${branches.at(-1)}` : answer}:`, async task => {
         if (!task) return setNotice('No task started: the prompt was empty.')
-        const path = await createTree(branch)
-        if (!path) return
-        setNotice(await startClaude(path, branch, task))
+        const started: string[] = []
+        for (const branch of branches) {
+          const path = await createTree(branch)
+          if (!path) continue
+          const said = await startClaude(path, branch, task)
+          if (!said.startsWith('Started')) return setNotice(said)
+          started.push(branch)
+        }
         refresh.current()
+        if (started.length > 0) setNotice(started.length === 1 ? `Started claude in ${started[0]} on the task.` : `Started claude in ${started.join(', ')} on the same task.`)
       })
     })
 
