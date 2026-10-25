@@ -102,8 +102,8 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'tabs',
     keys: [
-      ['tab', 'the other tab'],
-      ['1 2', 'worktrees, repo (or click its name)'],
+      ['tab', 'the next tab'],
+      ['1 2 3', 'worktrees, repo, agents (or click its name)'],
     ],
   },
   {
@@ -133,11 +133,11 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
   {
     area: 'agents',
     keys: [
-      ['t', 'jump to the worktree: its tmux pane, else a new window there'],
+      ['t', "jump to the worktree: its tmux pane, else a new window there; in the agents tab, the agent's own pane"],
       ['a', 'start claude in the worktree, in a new window'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's claude, in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
+      ['>', "reply: type a message into the worktree's claude (in the agents tab, the one under the cursor), in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
     ],
   },
   {
@@ -253,8 +253,8 @@ type Tree = {
 
 // A coding agent running in a worktree. Only for claude, from its transcript: whether it is busy, whether it waits
 // for the person (its turn done, or with `isAsking` asking leave to run a tool), what it last said or asks to run,
-// and while busy when its turn began, ms since the epoch. `spend` is what its session has used so far.
-type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number; spend?: Spend }
+// while busy when its turn began, and else when it went quiet, ms since the epoch. `spend` is what its session has used so far.
+type Agent = { name: string; pid: number; isBusy?: boolean; isWaiting?: boolean; isAsking?: boolean; says?: string; turnAt?: number; idleAt?: number; spend?: Spend }
 
 // Tokens a claude used, by kind: its prompts' new input, its output, cache writes (kept 5 minutes or an hour,
 // which cost differently) and cache reads.
@@ -313,7 +313,7 @@ type Diff = {
 type Token = { text: string; color?: string; isDim?: boolean; isItalic?: boolean; isBold?: boolean }
 type Style = Omit<Token, 'text'>
 
-type Tab = 'worktrees' | 'repo'
+type Tab = 'worktrees' | 'repo' | 'agents'
 
 // What kelp remembers across restarts: the tab, the rows opened or closed against how they start,
 // each tab's cursor and filter, and whether the repo tab shows diffs.
@@ -1029,7 +1029,7 @@ const hasChildSince = (pid: number, since: number) => {
 }
 
 // What a claude in `cwd` is up to, from how its newest transcript ends.
-const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'isAsking' | 'says' | 'turnAt'> => {
+const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaiting' | 'isAsking' | 'says' | 'turnAt' | 'idleAt'> => {
   const transcript = newestTranscript(cwd)
   if (!transcript) return { isBusy: false }
   const ending = readEnding(transcript.file, transcript.at)
@@ -1038,15 +1038,16 @@ const claudeState = (pid: number, cwd: string): Pick<Agent, 'isBusy' | 'isWaitin
   if (!ending) return { isBusy: isRecent }
   if (ending.kind === 'done') {
     const isWaiting = Date.now() - ending.at < WAITING_MS
-    return { isBusy: false, isWaiting, says: ending.says || undefined }
+    return { isBusy: false, isWaiting, says: ending.says || undefined, idleAt: ending.at }
   }
-  if (ending.kind === 'stopped') return { isBusy: false, says: ending.says || undefined }
+  if (ending.kind === 'stopped') return { isBusy: false, says: ending.says || undefined, idleAt: ending.at }
   const turnAt = ending.turnAt || undefined
-  if (ending.kind === 'working') return quiet < THINKING_MS ? { isBusy: true, turnAt } : { isBusy: false }
+  const says = ending.says || undefined
+  if (ending.kind === 'working') return quiet < THINKING_MS ? { isBusy: true, turnAt, says } : { isBusy: false, says, idleAt: transcript.at }
   // A tool call: running, unless it has sat a while with nothing started for it, as it waits for leave to run.
   const isRunning = quiet < ASKING_MS || LONG_TOOLS.includes(ending.tool ?? '') || ending.tool?.startsWith('mcp__') || hasChildSince(pid, ending.at)
 
-  return isRunning ? { isBusy: true, turnAt } : { isBusy: false, isWaiting: true, isAsking: true, says: ending.says }
+  return isRunning ? { isBusy: true, turnAt } : { isBusy: false, isWaiting: true, isAsking: true, says: ending.says, idleAt: ending.at }
 }
 
 // A process's parent, or 0 when it is gone. The parent's pid is the second field after the name, which ends at the last ")".
@@ -1119,10 +1120,9 @@ const openWindow = async (dir: string, name: string, command: string[] = []) => 
   return (await succeeds(['setsid', '-f', 'kitty', '--directory', dir, '--title', name, ...command])) ? 'a new kitty window' : null
 }
 
-// Brings forward a tmux pane in the worktree, or failing that opens a new window there named after its branch. Says what happened.
-const jumpTo = async (tree: Tree) => {
+// Brings forward a tmux pane in the worktree, `pane` when given, or failing that opens a new window there named after its branch. Says what happened.
+const jumpTo = async (tree: Tree, pane: Pane | undefined = tree.panes[0]) => {
   const name = label(tree)
-  const pane = tree.panes[0]
   if (pane && (await succeeds(['tmux', 'select-window', '-t', pane.id])) && (await succeeds(['tmux', 'select-pane', '-t', pane.id]))) {
     // Only needed when the pane is in another session.
     await succeeds(['tmux', 'switch-client', '-t', pane.id])
@@ -1340,6 +1340,9 @@ const dollarCount = (n: number) => `$${n < 100 ? n.toFixed(2) : Math.round(n)}`
 
 // A count of tokens, short: "820", "45k", "1.2M".
 const tokenCount = (n: number) => (n < 1000 ? String(n) : n < 1_000_000 ? `${Math.round(n / 1000)}k` : `${(n / 1_000_000).toFixed(1)}M`)
+
+// What a session has used, short: its cost when every model it used has a price, else its tokens.
+const spendText = (spend: Spend) => (spend.dollars !== undefined ? dollarCount(spend.dollars) : `${tokenCount(spend.tokens)} tokens`)
 
 // ---- Ports ----
 
@@ -1808,6 +1811,21 @@ const runState = (run: Run) => {
   return { mark: '✗', color: 'red', text: `${run.code === null ? 'stopped' : `exit ${run.code}`} · ${took}` }
 }
 
+// A text cut into lines of at most `width` columns, at spaces where it can.
+const wrapText = (text: string, width: number) => {
+  const lines: string[] = []
+  let rest = text.trim()
+  while (rest.length > width) {
+    const space = rest.lastIndexOf(' ', width)
+    const at = space > 0 ? space : width
+    lines.push(rest.slice(0, at))
+    rest = rest.slice(at).trimStart()
+  }
+  if (rest) lines.push(rest)
+
+  return lines
+}
+
 const clockTime = (at: number) => {
   const d = new Date(at)
 
@@ -1841,7 +1859,7 @@ const newLineNumbers = (lines: string[]) => {
 
 // The header starts with kelp's name and then each tab's, one space apart.
 const HEADER_LEAD = 'kelp  '
-const TABS: Tab[] = ['worktrees', 'repo']
+const TABS: Tab[] = ['worktrees', 'repo', 'agents']
 
 // The first and last column of a tab's name in the header, counted from 1 as mouse reports count them,
 // so a click finds the tab whatever the names are.
@@ -2331,8 +2349,8 @@ const buildRows = (
     // What each claude's session has cost so far, or with a model of unknown price the tokens it used,
     // and how full its context is: yellow from 80%, red from 95%, as it nears compacting.
     for (const { name, spend } of tree.agents.filter(a => a.spend)) {
-      const { dollars, tokens, context } = spend!
-      details.push({ text: `${name} ${dollars !== undefined ? dollarCount(dollars) : `${tokenCount(tokens)} tokens`}` })
+      details.push({ text: `${name} ${spendText(spend!)}` })
+      const { context } = spend!
       if (context > 0) details.push({ text: `${Math.round(context * 100)}% context`, color: context >= 0.95 ? 'red' : context >= 0.8 ? 'yellow' : undefined })
     }
     // What each agent not at work last said, or asks to run, so it can be read without going there.
@@ -2602,6 +2620,69 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
   return { rows, wanted }
 }
 
+// What an agent is up to, as the agents tab sorts and marks it: waiting for the person, at work, or idle.
+type AgentState = 'waiting' | 'busy' | 'idle'
+const agentState = (agent: Agent): AgentState => (agent.isWaiting ? 'waiting' : agent.isBusy !== false ? 'busy' : 'idle')
+const AGENT_STATES: AgentState[] = ['waiting', 'busy', 'idle']
+const AGENT_LOOKS: Record<AgentState, { mark: string; color?: string }> = { waiting: { mark: '◆', color: 'yellow' }, busy: { mark: '●', color: 'green' }, idle: { mark: '○' } }
+
+// The agents tab's lines: every agent running in any worktree, those waiting for the person first, then those at work,
+// then the idle ones, each with its worktree's branch, how long it has been on its turn or idle, and the start of
+// what it last said. Opened, its worktree's folder, its tmux pane, and all it last said or asks.
+// With a `query`, only the agents whose name, branch or words match it.
+const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, columns: number, query: string) => {
+  const rows: Row[] = []
+  const panes = repo.trees.flatMap(t => t.panes)
+  const note = (key: string, parent: string, depth: number, text: string) =>
+    rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
+  const all = repo.trees
+    .flatMap(tree => tree.agents.map(agent => ({ agent, tree, state: agentState(agent) })))
+    .filter(({ agent, tree }) => isMatch(query, [agent.name, label(tree), agent.says ?? '']))
+    .sort((a, b) => AGENT_STATES.indexOf(a.state) - AGENT_STATES.indexOf(b.state) || label(a.tree).localeCompare(label(b.tree)) || a.agent.pid - b.agent.pid)
+  // Names and branches padded to line up, a very long branch cut.
+  const nameWidth = Math.max(0, ...all.map(a => a.agent.name.length))
+  const branchWidth = Math.min(30, Math.max(0, ...all.map(a => label(a.tree).length)))
+
+  for (const { agent, tree, state } of all) {
+    const key = `agent\t${tree.path}\t${agent.pid}`
+    const open = isOpen(key, false)
+    const look = AGENT_LOOKS[state]
+    const name = label(tree)
+    const branch = name.length > branchWidth ? `${name.slice(0, branchWidth - 1)}…` : name
+    const since = state === 'busy' ? agent.turnAt : agent.idleAt
+    rows.push({
+      key,
+      depth: 0,
+      canOpen: true,
+      node: (
+        <Text wrap="truncate-end">
+          <Text dimColor>{open ? '▾' : '▸'} </Text>
+          <Text color={look.color} dimColor={!look.color}>{look.mark} {agent.name.padEnd(nameWidth)}</Text>
+          {'  '}
+          <Text bold color={tree.isBase ? undefined : 'blue'}>{branch.padEnd(branchWidth)}</Text>
+          <Text dimColor={state === 'idle'}>  {(since ? duration(Date.now() - since) : '').padStart(7)}</Text>
+          {agent.says && <Text dimColor>  {agent.says}</Text>}
+        </Text>
+      ),
+    })
+    if (!open) continue
+
+    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${tree.isBase ? ' · base' : ''} · pid ${agent.pid}${agent.spend ? ` · ${spendText(agent.spend)}` : ''}`)
+    const pane = paneOf(panes, agent.pid)
+    const where = pane
+      ? `tmux ${pane.id} · window ${pane.window} (${pane.windowName}) · ${pane.command}`
+      : process.env.TMUX ? 'in no tmux pane kelp can see' : 'kelp is not in tmux, so it sees no panes'
+    note(`${key}\tpane`, key, 1, where)
+    const says = agent.says ? wrapText(agent.isAsking ? `asks: ${agent.says}` : agent.says, columns - 2) : []
+    says.forEach((line, n) => rows.push({ key: `${key}\tsays\t${n}`, parent: key, depth: 1, node: <Text wrap="truncate-end">{line}</Text> }))
+  }
+  if (all.length === 0) {
+    note('none', '', 0, query ? `No agent matches "${query}".` : 'No agents running: N starts claude on a new task, a on a worktree starts one there.')
+  }
+
+  return { rows, wanted: [] as Wanted[] }
+}
+
 // ---- Actions ----
 
 // What the merge keys do to a worktree: u merges the base into it, m merges its branch into the base,
@@ -2787,7 +2868,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const [size, setSize] = useState({ columns: stdout.columns, rows: stdout.rows })
-  const [tab, setTab] = useState<Tab>(saved.tab === 'repo' ? 'repo' : 'worktrees')
+  const [tab, setTab] = useState<Tab>(TABS.find(t => t === saved.tab) ?? 'worktrees')
   const [repo, setRepo] = useState<Repo | null | undefined>(undefined)
   // The repo tab's files, read only while it is shown.
   const [files, setFiles] = useState<Files | null | undefined>(undefined)
@@ -2825,13 +2906,13 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // How far the list of keys is scrolled, when it is longer than the screen.
   const [helpTop, setHelpTop] = useState(0)
   // Each tab's `/` filter, '' for none.
-  const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '', ...saved.filters })
+  const [filters, setFilters] = useState<Record<Tab, string>>({ worktrees: '', repo: '', agents: '', ...saved.filters })
   // Each tab keeps its own cursor and scroll.
-  const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '', ...saved.cursors })
+  const [cursors, setCursors] = useState<Record<Tab, string>>({ worktrees: '', repo: '', agents: '', ...saved.cursors })
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
   const [, redraw] = useState(0)
-  const tops = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0 })
-  const lastIndexes = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0 })
+  const tops = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0, agents: 0 })
+  const lastIndexes = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0, agents: 0 })
   const tabRef = useRef(tab)
   tabRef.current = tab
   const pending = useRef(new Set<string>())
@@ -2942,10 +3023,10 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     }
   }, [dir, github])
 
-  // Ticks while a command runs, so its time stays current.
+  // Ticks while a command runs, or the agents tab shows, so their times stay current.
   useEffect(() => {
     const timer = setInterval(() => {
-      if ([...runs.values()].some(r => isRunning(r))) redraw(n => n + 1)
+      if (tabRef.current === 'agents' || [...runs.values()].some(r => isRunning(r))) redraw(n => n + 1)
     }, 1000)
 
     return () => clearInterval(timer)
@@ -2972,7 +3053,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const { rows, wanted } =
     tab === 'repo'
       ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
-      : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
+      : tab === 'agents'
+        ? (repo ? buildAgentRows(repo, isOpen, columns, filters.agents) : empty)
+        : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
@@ -3092,7 +3175,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
     const name = label(tree)
     const claudes = tree.agents.filter(a => a.name === 'claude')
-    const agent = claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
+    const under = agentUnder()
+    const agent = (under?.name === 'claude' ? under : undefined) ?? claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
     if (!agent) return setNotice(`No claude runs in ${name}, so there is nothing to send to: a starts one.`)
     if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to claude in ${name} through.`)
     const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
@@ -3118,6 +3202,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       setNotice(isSent ? `Sent to claude in ${name}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
       refresh.current()
     })
+  }
+
+  // The agent under the cursor in the agents tab, its line or one of its opened lines, keyed "agent\t<worktree>\t<pid>".
+  const agentUnder = () => {
+    const [kind, path, pid] = row?.key.split('\t') ?? []
+    if (tab !== 'agents' || kind !== 'agent') return undefined
+
+    return repo?.trees.find(t => t.path === path)?.agents.find(a => a.pid === Number(pid))
   }
 
   // The worktree under the cursor, or in the repo tab the one it explores.
@@ -3678,7 +3770,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     } catch {
       return setNotice(`Couldn't run ${command} in ${shortPath(tree)}`)
     }
-    if (tab === 'repo') return setNotice(`Running ${command} in ${treeName(tree)}; its output is in the worktrees tab`)
+    if (tab !== 'worktrees') return setNotice(`Running ${command} in ${treeName(tree)}; its output is in the worktrees tab`)
     // Open the worktree and its run section, and go to it.
     const key = `tree\t${tree}`
     setToggled(cur => {
@@ -3733,7 +3825,10 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === '>') reply()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
-      if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree.path, label(tree))).then(text => {
+      // In the agents tab, t goes to the agent's own pane.
+      const agent = agentUnder()
+      const pane = agent && repo ? paneOf(repo.trees.flatMap(t => t.panes), agent.pid) : undefined
+      if (tree) (input === 't' ? jumpTo(tree, pane ?? tree.panes[0]) : startClaude(tree.path, label(tree))).then(text => {
         setNotice(text)
         refresh.current()
       })
@@ -3782,9 +3877,10 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
         runIn(tree, found.command)
       }, last)
     }
-    else if (key.tab) switchTab(tab === 'worktrees' ? 'repo' : 'worktrees')
+    else if (key.tab) switchTab(TABS[(TABS.indexOf(tab) + 1) % TABS.length])
     else if (input === '1') switchTab('worktrees')
     else if (input === '2') switchTab('repo')
+    else if (input === '3') switchTab('agents')
     else if (input === 'd' && !key.ctrl && tab === 'repo') setIsDiff(v => !v)
     else if (input === 'o') {
       // A row with no file of its own, such as "Loading…", opens the file it sits under.
@@ -3792,7 +3888,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       if (at?.file) openInNvim(at.file, at.line ?? 1).then(setNotice)
     }
     else if (input === 'n' && tab === 'worktrees' && repo) ask('new worktree for branch', createTree)
-    else if (input === 'N' && tab === 'worktrees' && repo) newTask()
+    else if (input === 'N' && tab !== 'repo' && repo) newTask()
     else if ((input === 'x' || input === 'X') && tab === 'worktrees') removeTree(input === 'X')
     else if (input === 'C' && tab === 'worktrees') cleanUp()
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
@@ -3816,6 +3912,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
   const conflicting = repo ? repo.trees.filter(t => t.conflicts.length > 0).length : 0
   const changed = files ? Object.keys(files.status).length : 0
+  const agents = repo ? repo.trees.flatMap(t => t.agents) : []
+  const waitingCount = agents.filter(a => a.isWaiting).length
   const header = (
     <Text wrap="truncate-end">
       <Text bold>{HEADER_LEAD}</Text>
@@ -3837,6 +3935,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
         <Text dimColor>  {shortPath(files.dir)} · {files.files.length}{files.isCut ? '+' : ''} files · showing {isDiff ? 'diffs vs HEAD' : 'files'}</Text>
       )}
       {tab === 'repo' && changed > 0 && <Text color="yellow"> · {changed} changed</Text>}
+      {tab === 'agents' && repo && <Text dimColor>  {agents.length} agent{agents.length === 1 ? '' : 's'}</Text>}
+      {tab === 'agents' && waitingCount > 0 && <Text color="yellow"> · {waitingCount} waiting</Text>}
     </Text>
   )
   // The footer keeps to the keys most wanted here; `?` lists them all. Discarding is offered only on an uncommitted file.
@@ -3848,12 +3948,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
   // Answering is offered where a claude waits for the person.
-  const replyKey = treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting) ? ' · > reply' : ''
+  const replyKey = (tab === 'agents' ? agentUnder()?.name === 'claude' : treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting)) ? ' · > reply' : ''
   const keys = isHelp
     ? `? esc close${helpLines.length > height ? ' · j k scroll' : ''}`
     : tab === 'repo'
-      ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+      ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab agents · ? keys · q quit`
+      : tab === 'agents'
+        ? `⏎ open · ${find} · t tmux${replyKey} · a claude · N task · tab worktrees · ? keys · q quit`
+        : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   const help = (
     <Box flexDirection="column">
       {helpLines.slice(shownHelpTop, shownHelpTop + helpRoom).map((cells, n) => (
@@ -3880,8 +3982,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       {header}
       {isHelp && <Box flexDirection="column" flexGrow={1}>{help}</Box>}
       <Box flexDirection="column" flexGrow={1} display={isHelp ? 'none' : 'flex'}>
-        {tab === 'worktrees' && repo === undefined && <Text dimColor>Reading worktrees…</Text>}
-        {tab === 'worktrees' && repo === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
+        {tab !== 'repo' && repo === undefined && <Text dimColor>Reading worktrees…</Text>}
+        {tab !== 'repo' && repo === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
         {tab === 'repo' && files === undefined && <Text dimColor>Listing the repository…</Text>}
         {tab === 'repo' && files === null && <Text dimColor>No git repository here, nor in any folder directly inside {shortPath(root)}.</Text>}
         {rows.slice(top, top + height).map((r, k) => {
