@@ -39,7 +39,6 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `o` open in nvim at the line under the cursor
 - `t` jump to the worktree in tmux, or open a window there
 - `a` start claude in the worktree, in a new window
-- `t` jump to the worktree in tmux
 - `n` new worktree
 - `u` merge the base in
 - `m` merge into the base
