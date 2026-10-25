@@ -686,6 +686,13 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
     treeAt(trees, cwd)?.agents.push(rest)
   }
   for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
+  // A claude showing its menu asking leave to run a tool looks busy in its transcript, which gets the tool call
+  // only once it is answered; so the pane of each busy one is read, once a refresh, and one asking is waiting.
+  const busy = trees.flatMap(t => t.agents).filter(a => a.name === 'claude' && a.isBusy)
+  await Promise.all(busy.map(async agent => {
+    const pane = paneOf(panes, agent.pid)
+    if (pane && (await isAskingIn(pane))) Object.assign(agent, { isBusy: false, isWaiting: true, isAsking: true, turnAt: undefined })
+  }))
   for (const { path, port } of await findListening(trees)) {
     const tree = trees.find(t => t.path === path)!
     if (!tree.ports.includes(port)) tree.ports.push(port)
