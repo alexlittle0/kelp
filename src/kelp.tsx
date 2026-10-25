@@ -1132,7 +1132,8 @@ const paneOf = (panes: Pane[], pid: number) => {
 }
 
 // Types `text` into a tmux pane and presses Enter, as if typed there. Enter waits a moment, so an agent
-// takes the text as typed rather than as a paste still coming in, where Enter would only start a new line. Whether it went.
+// takes the text as typed rather than as a paste still coming in, where Enter would only start a new line
+// (claude 2.1 takes it even with no wait; the wait is to be safe). Whether it went.
 const typeInto = async (pane: Pane, text: string) => {
   if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, '-l', '--', text]))) return false
   await Bun.sleep(150)
