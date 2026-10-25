@@ -266,6 +266,8 @@ type Tree = {
   panes: Pane[]
   // The ports that processes running in it listen on, reachable at localhost.
   ports: number[]
+  // Whether its .kelp.json, or the main worktree's, hands $PORT or $KELP_PORT on to a command, so its port is worth showing.
+  isPortUsed: boolean
   // The remote branch it tracks, such as "origin/feature", or '' when it tracks none,
   // how far it is ahead of and behind that, and whether that branch is gone from the remote.
   upstream: string
@@ -673,6 +675,7 @@ const loadTree = async (
     agents: [],
     panes: [],
     ports: [],
+    isPortUsed: false,
     ...(upstreams.get(w.branch) ?? { upstream: '', unpushed: 0, unpulled: 0, isUpstreamGone: false }),
   }
 }
@@ -750,6 +753,10 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
     if (!tree.ports.includes(port)) tree.ports.push(port)
   }
   for (const tree of trees) tree.ports.sort((a, b) => a - b)
+  const main = trees.find(t => t.isMain)?.path ?? dir
+  const isPortIn = (folder: string) => /\$\{?PORT\b|KELP_PORT/.test(readText(`${folder}/.kelp.json`) ?? '')
+  const isMainPortUsed = isPortIn(main)
+  for (const tree of trees) tree.isPortUsed = isMainPortUsed || isPortIn(tree.path)
 
   return { dir, base, remote, github: githubPage(url), trees }
 }
@@ -2503,9 +2510,9 @@ const buildRows = (
       if (isRunning(run) || run.code !== 0) parts.push({ text: `${state.mark} ${what}`, color: state.color })
       if (isRunning(run) && run.url) details.push({ text: run.url.replace(/^https?:\/\//, ''), color: 'cyan' })
     }
-    // The port kelp hands its commands as $PORT.
+    // The port kelp hands its commands as $PORT, when .kelp.json passes it on or something here serves.
     const port = portOf(tree, repo.trees)
-    if (port) details.push({ text: `port ${port}` })
+    if (port && (tree.isPortUsed || tree.ports.length > 0)) details.push({ text: `port ${port}` })
     if (tree.ports.length > 0) details.push({ text: `serving ${tree.ports.map(p => `:${p}`).join(' ')}`, color: 'cyan' })
     // Its agents: one waiting for the person and a busy one on the line, the idle ones in the details.
     const waiting = tree.agents.filter(a => a.isWaiting)
