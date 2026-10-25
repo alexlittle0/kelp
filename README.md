@@ -26,6 +26,7 @@ Run it inside any worktree, or in the folder that holds them. It refreshes every
 - **new worktrees**: `n` asks for a branch name and makes a worktree for it: the branch when it exists, here or on origin, else a new one from the base. It goes beside the other worktrees when they share a folder, else next to the repository as `<repo>-<branch>`
 - **repo**: a second tab with the file tree of the worktree kelp runs in; open a file to read it, or press `d` to see its diff against HEAD instead. Changed files and the folders holding them are marked
 - **run**: press `!` to run a shell command in the worktree under the cursor (in the repo tab, the one explored). The end of its output streams in under the worktree with its exit code and how long it took, and the worktree's line shows how it is doing. Several can run at once, in different worktrees, while you keep using kelp
+- **filter**: `/` narrows the tab as you type, fzf style (letters in order, any case, each word matched on its own): worktrees by branch, folder or the names of the files they change, the repo tab by file path with the folders holding the matches opened. `⏎` keeps the filter, `esc` drops it
 
 Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists them all):
 
@@ -45,5 +46,7 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `r` refresh
 - `?` list every key
 - `q` quit
+Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `t` jump to the worktree in tmux, `u` merge the base in, `U` abort a merge, `!` run a command in the worktree, `r` refresh, `?` list every key, `q` quit.
+Keys: `↑↓`/`jk` move, `⏎`/space or a click open or close, the mouse wheel scrolls, `→`/`l` open, `←`/`h` close or step out, `g`/`G` top or bottom, `PgUp`/`PgDn` page, `tab`, `1`/`2` or a click on its name switch tab, `d` file or diff (repo tab), `o` open in nvim at the line under the cursor, `n` new worktree, `u` merge the base in, `U` abort a merge, `!` run a command in the worktree, `/` filter, `esc` clear it, `r` refresh, `?` list every key, `q` quit.
 
 `bun run build` makes a single `dist/kelp` binary to put on your PATH.
