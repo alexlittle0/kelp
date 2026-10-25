@@ -85,6 +85,12 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     ],
   },
   {
+    area: 'agents',
+    keys: [
+      ['t', 'jump to the worktree: its tmux pane, else a new window there'],
+    ],
+  },
+  {
     area: 'merge',
     keys: [
       ['u', 'merge the base branch into the worktree (twice)'],
@@ -653,6 +659,37 @@ const listPanes = async () => {
   } catch {
     return []
   }
+}
+
+// Whether a command ran and exited 0.
+const succeeds = async (args: string[]) => {
+  try {
+    return (await Bun.spawn(args, { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }).exited) === 0
+  } catch {
+    return false
+  }
+}
+
+// Opens a window named `name` in `dir` running `command`, a shell when none: a new tmux window inside tmux,
+// else a new kitty window. Says which, or null when it couldn't.
+const openWindow = async (dir: string, name: string, command: string[] = []) => {
+  if (process.env.TMUX) return (await succeeds(['tmux', 'new-window', '-c', dir, '-n', name, ...command])) ? 'a new tmux window' : null
+
+  return (await succeeds(['setsid', '-f', 'kitty', '--directory', dir, '--title', name, ...command])) ? 'a new kitty window' : null
+}
+
+// Brings forward a tmux pane in the worktree, or failing that opens a new window there named after its branch. Says what happened.
+const jumpTo = async (tree: Tree) => {
+  const name = label(tree)
+  const pane = tree.panes[0]
+  if (pane && (await succeeds(['tmux', 'select-window', '-t', pane.id])) && (await succeeds(['tmux', 'select-pane', '-t', pane.id]))) {
+    // Only needed when the pane is in another session.
+    await succeeds(['tmux', 'switch-client', '-t', pane.id])
+    return `Switched to tmux window ${pane.window} (${pane.windowName}), ${pane.command} in ${name}`
+  }
+  const where = await openWindow(tree.path, name)
+
+  return where ? `Opened ${name} in ${where}` : `Couldn't open a window in ${shortPath(tree.path)}`
 }
 
 // ---- GitHub ----
@@ -1585,6 +1622,10 @@ const App = ({ root }: { root: string }) => {
     if (clicked.canOpen) toggle(clicked.key)
   }
 
+  // The worktree under the cursor, or in the repo tab the one it explores.
+  const treeUnder = () =>
+    tab === 'repo' ? (repo && files ? treeAt(repo.trees, files.dir) : undefined) : repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
+
   // Runs what a key plans for the worktree under the cursor on its second press, the first saying what it will do.
   const act = (action: Action) => {
     const tree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
@@ -1703,6 +1744,13 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
     else if (input === 'm' && tab === 'worktrees') act('land')
+    else if (input === 't') {
+      const tree = treeUnder()
+      if (tree) jumpTo(tree).then(text => {
+        setNotice(text)
+        refresh.current()
+      })
+    }
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()
@@ -1761,7 +1809,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · n new · o nvim · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
