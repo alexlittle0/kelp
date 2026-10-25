@@ -81,6 +81,8 @@ const MAX_TURNS = 50
 const MAX_TURN_TEXT = 4000
 // Lines of a reply or prompt shown before it is opened for the rest, and of a tool call's input and result shown once opened.
 const REPLY_LINES = 3
+// Entries an opened conversation shows, the earlier ones behind a row of their own.
+const RECENT_TURNS = 10
 const TOOL_INPUT_LINES = 6
 const TOOL_RESULT_LINES = 8
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
@@ -2666,8 +2668,14 @@ const buildRows = (
         ),
       })
       if (!isChatOpen) continue
-      const turns = agent.turns!
-      if (turns.length === 0) note(`${group}\tnone`, group, 2, 'Nothing said yet.')
+      // The latest entries, the earlier ones folded away so the end shows.
+      const earlier = `${group}\tearlier`
+      const hidden = Math.max(0, agent.turns!.length - RECENT_TURNS)
+      const turns = hidden > 0 && !isOpen(earlier, false) ? agent.turns!.slice(hidden) : agent.turns!
+      if (agent.turns!.length === 0) note(`${group}\tnone`, group, 2, 'Nothing said yet.')
+      if (hidden > 0) {
+        rows.push({ key: earlier, parent: group, depth: 2, canOpen: true, node: <Text dimColor wrap="truncate-end">{isOpen(earlier, false) ? '▾' : '▸'} {hidden} earlier {hidden === 1 ? 'entry' : 'entries'}</Text> })
+      }
       // Paths in the worktree are shown from its folder.
       const here = (text: string) => shortPath(text.replaceAll(`${tree.path}/`, ''))
       const width = Math.max(10, room(2) - 2)
@@ -3211,6 +3219,18 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
           const { agent, tree } = started[0]
           const others = started.length > 1 ? `, and ${started.length - 1} more` : ''
           setNotice(`◆ ${agent.name} in ${label(tree)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''}${others}`)
+          // Its conversation opens, its last entry too, so what it asks shows once its worktree is opened.
+          setToggled(cur => {
+            const next = new Set(cur)
+            for (const { agent, tree } of started.filter(s => s.agent.turns)) {
+              const group = `tree\t${tree.path}\tchat\t${agent.session}`
+              const last = agent.turns!.at(-1)
+              next.add(group)
+              if (last) next.add(`${group}\t${last.key}`)
+            }
+
+            return next
+          })
         }
         const text = JSON.stringify(found)
         if (text !== seen) {
