@@ -159,7 +159,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'git',
     keys: [
       ['c', 'commit what is staged, or with nothing staged everything, asking for the message'],
-      ['+ -', 'stage, unstage the uncommitted file (on "uncommitted": all of them)'],
+      ['+ -', 'stage, unstage the uncommitted file (on "uncommitted": all; in its diff: the hunk)'],
       ['z', 'stash the uncommitted changes, untracked included, asking for a message'],
       ['Z', 'pop the stash under the cursor, or the worktree\'s latest (twice)'],
       ['D', "discard an uncommitted file's changes (twice)"],
@@ -357,6 +357,19 @@ const gitRun = async (cwd: string, args: string[], env?: Record<string, string>)
     return { out, code: await proc.exited }
   } catch {
     return null
+  }
+}
+
+// Applies a patch to the index, or with `isReverse` takes it back out: null when it worked, else why not.
+const applyToIndex = async (cwd: string, patch: string, isReverse: boolean) => {
+  try {
+    const args = ['git', 'apply', '--cached', ...(isReverse ? ['--reverse'] : []), '-']
+    const proc = Bun.spawn(args, { cwd, stdin: new TextEncoder().encode(patch), stdout: 'ignore', stderr: 'pipe' })
+    const err = await new Response(proc.stderr).text()
+
+    return (await proc.exited) === 0 ? null : whyFailed(err).replace(/^(fatal|error): /, '')
+  } catch {
+    return "git couldn't start"
   }
 }
 
@@ -3107,8 +3120,43 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     })
   }
 
-  // Stages (+) or unstages (-) the uncommitted file under the cursor, or on a worktree's "uncommitted" line all its files.
+  // The hunk the cursor is in, on a line of an uncommitted file's diff: the file's folder and path, the hunk's lines,
+  // and whether the diff shown is of staged changes. Only for a changed file git tracks; a new, deleted
+  // or binary one is staged whole.
+  const hunkUnder = () => {
+    const tree = treeUnder()
+    const parent = row?.parent
+    const at = Number(row?.key.split('\t').pop())
+    const parts = parent?.split('\t') ?? []
+    if (tab !== 'worktrees' || !tree || !parent || parts[2] !== 'uncommitted' || parts.length !== 4 || !Number.isInteger(at)) return undefined
+    const change = tree.uncommitted.find(c => c.path === parts[3])
+    const diff = diffs.get(parent)
+    if (!change || change.tag !== '' || change.isUntracked || !diff) return undefined
+    const start = diff.lines.findLastIndex((l, n) => n <= at && l.startsWith('@@'))
+    const next = diff.lines.findIndex((l, n) => n > at && l.startsWith('@@'))
+    const end = next === -1 ? diff.lines.length : next
+    if (start === -1) return undefined
+
+    return { dir: tree.path, file: change.path, change, lines: diff.lines.slice(start, end), isCut: diff.isCut && next === -1, isStaged: change.stage === 'staged' }
+  }
+
+  // Stages (+) or unstages (-) the hunk under the cursor in a file's diff by applying it to the index, as a patch.
+  const stageHunk = async (hunk: NonNullable<ReturnType<typeof hunkUnder>>, isStage: boolean) => {
+    const { dir, file } = hunk
+    if (hunk.isCut) return setNotice(`The diff of ${file} is cut short there: stage the whole file with ${isStage ? '+' : '-'} on its line.`)
+    if (hunk.change.stage === 'partly') return setNotice(`${file} is partly staged: stage or unstage it whole on its line.`)
+    if (isStage === hunk.isStaged) return setNotice(`That hunk of ${file} is already ${isStage ? 'staged' : 'unstaged'}.`)
+    const patch = `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${hunk.lines.join('\n')}\n`
+    const failed = await applyToIndex(dir, patch, !isStage)
+    await refresh.current()
+    setNotice(failed ? `Couldn't ${isStage ? 'stage' : 'unstage'} the hunk: ${failed}` : `${isStage ? 'Staged' : 'Unstaged'} a hunk of ${file}.`)
+  }
+
+  // Stages (+) or unstages (-) the uncommitted file under the cursor, or on a worktree's "uncommitted" line all its files;
+  // on a line of a file's diff, only the hunk it is in.
   const stage = async (isStage: boolean) => {
+    const hunk = hunkUnder()
+    if (hunk) return stageHunk(hunk, isStage)
     const tree = treeUnder()
     const isAll = tab === 'worktrees' && tree !== undefined && row?.key === `tree\t${tree.path}\tuncommitted`
     const under = isAll ? undefined : uncommittedUnder()
