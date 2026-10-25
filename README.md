@@ -9,11 +9,12 @@ bun src/kelp.tsx [folder] [--cd-file <path>]
 
 Run it inside any worktree, or in the folder that holds them. It refreshes every few seconds.
 
-- **worktrees**: one line each, closed to start, saying only what wants a look: conflicts, a merge or rebase under way, failing checks, a busy agent or a running command, how many files are uncommitted, how far it is ahead of and behind the base branch, and when it last changed. Open one for its folder and the rest (idle agents, tmux panes, upstream, its pull request), its uncommitted files and its commits
+- **worktrees**: one line each, closed to start, saying only what wants a look: conflicts, a merge or rebase under way, failing checks, a busy agent or a running command, how many files are uncommitted, how far it is ahead of and behind the base branch, and when it last changed. Open one for its folder and the rest (idle agents, tmux panes, upstream, its pull request), its uncommitted files, its stashes and its commits
 - **upstream**: how far each branch is ahead of (`↑2`) and behind (`↓1`) the remote branch it tracks, or that it is not pushed yet
 - **pull requests**: on a GitHub repository with `gh` installed and logged in, each branch's pull request: its number, whether it is a draft, open, merged or closed, its review decision and whether its checks pass, fail or are still running. Open a worktree to see the PR's title and the checks failing. Fetched with one `gh pr list` in the background every minute, so it never slows the view down
 - **push and PRs**: `p` pushes a worktree's branch, setting its upstream the first time; `P` (twice) pushes it if needed and opens a pull request into the base with `gh pr create --fill`; `b` opens its pull request, or else its branch, on GitHub in the browser
 - **uncommitted**: the files changed since the worktree's last commit, untracked ones included. `+` stages the file under the cursor and `-` unstages it, or on the "uncommitted" line every file; a staged file is green and says `staged`, or `partly staged` when it has changed since, and the details count the staged and unstaged files
+- **stashes**: an open worktree lists the stashes made on its branch, each opening to its files and their diffs, untracked ones included, and its details count them. `z` stashes the worktree's uncommitted changes, untracked files included, asking for a message; `Z` (twice) pops the stash under the cursor, or else the worktree's latest
 - **commits**: the commits since the worktree left the base branch (the base's own worktree shows its latest few), each with its files
 - **diffs**: open a file to read its diff
 - **conflicts**: a worktree behind the base branch says whether merging the base in would conflict, its uncommitted edits included, and lists the files that would; open one to see its conflicts as the merge would leave them. Worked out in memory with `git merge-tree`, so nothing in the worktree changes
@@ -63,6 +64,8 @@ Keys (one per line, so branches adding keys merge cleanly; `?` in kelp lists the
 - `K` (twice) stop the command running there
 - `c` commit what is staged, else everything in the worktree
 - `+`/`-` stage or unstage the file, or on "uncommitted" every file
+- `z` stash the uncommitted changes
+- `Z` (twice) pop the stash under the cursor, or the latest
 - `D` (twice) discard a file's changes
 - `p` push the branch
 - `P` (twice) open a pull request with gh
