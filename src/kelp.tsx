@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
 import { useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
@@ -79,6 +79,12 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     ],
   },
   {
+    area: 'worktrees',
+    keys: [
+      ['n', 'new worktree: asks for a branch'],
+    ],
+  },
+  {
     area: 'merge',
     keys: [
       ['u', 'merge the base branch into the worktree (twice)'],
@@ -114,6 +120,8 @@ type Tree = {
   branch: string
   head: string
   isBase: boolean
+  // The repository's first worktree, which git cannot remove.
+  isMain: boolean
   ahead: number
   behind: number
   commits: Commit[]
@@ -230,17 +238,17 @@ const findRepo = async (dir: string) => {
   return null
 }
 
-// The worktrees git knows of, leaving out bare ones and those whose folder is gone.
+// The worktrees git knows of, leaving out bare ones and those whose folder is gone. Git lists the main one first.
 const listWorktrees = async (dir: string) => {
   const text = (await git(dir, ['worktree', 'list', '--porcelain'])) ?? ''
 
   return text
     .split('\n\n')
-    .map(block => {
+    .map((block, n) => {
       const lines = block.split('\n')
       const value = (name: string) => lines.find(l => l.startsWith(`${name} `))?.slice(name.length + 1) ?? ''
 
-      return { path: value('worktree'), head: value('HEAD'), branch: value('branch').replace(/^refs\/heads\//, ''), isBare: lines.includes('bare') }
+      return { path: value('worktree'), head: value('HEAD'), branch: value('branch').replace(/^refs\/heads\//, ''), isMain: n === 0, isBare: lines.includes('bare') }
     })
     .filter(w => w.path && !w.isBare && existsSync(w.path))
 }
@@ -386,7 +394,7 @@ const readUpstreams = async (dir: string) => {
 
 type Upstreams = Awaited<ReturnType<typeof readUpstreams>>
 
-const loadTree = async (w: { path: string; head: string; branch: string }, base: string, upstreams: Upstreams): Promise<Tree> => {
+const loadTree = async (w: { path: string; head: string; branch: string; isMain: boolean }, base: string, upstreams: Upstreams): Promise<Tree> => {
   const isBase = w.branch === base
   const range = isBase ? [`-${BASE_COMMITS}`, 'HEAD'] : [`-${MAX_COMMITS}`, `${base}..HEAD`]
   const [log, counts, uncommitted, headAt, mergeHead] = await Promise.all([
@@ -807,6 +815,38 @@ const stopRun = (run: Run) => {
   }
   signal('SIGTERM')
   setTimeout(() => signal('SIGKILL'), 3000).unref()
+}
+
+// ---- Lifecycle ----
+
+// Runs git for a change it makes: null when it worked, else why not.
+const gitDo = async (cwd: string, args: string[]) => {
+  const run = await runCommand(cwd, ['git', ...args])
+
+  return run === null ? "git couldn't start" : run.code === 0 ? null : whyFailed(run.err).replace(/^(fatal|error): /, '')
+}
+
+// Where a new worktree for `branch` goes: beside the other worktrees when they share a folder,
+// else next to the main one as <repo>-<branch>.
+const newTreePath = (repo: Repo, branch: string) => {
+  const name = branch.replace(/\//g, '-')
+  const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
+  const folders = repo.trees.filter(t => !t.isMain).map(t => dirname(t.path))
+  const isShared = folders.length > 0 && folders.every(f => f === folders[0]) && folders[0] !== dirname(main)
+
+  return isShared ? `${folders[0]}/${name}` : `${dirname(main)}/${basename(main)}-${name}`
+}
+
+// Makes a worktree for `branch` at `path`: the branch when it exists here or on origin, else a new one from the base.
+// Null when it worked, else why not.
+const addTree = async (repo: Repo, branch: string, path: string) => {
+  if ((await git(repo.dir, ['check-ref-format', '--branch', branch])) === null) return `"${branch}" is not a valid branch name`
+  if (existsSync(path)) return `${shortPath(path)} already exists`
+  const has = async (ref: string) => (await git(repo.dir, ['rev-parse', '--verify', '--quiet', ref])) !== null
+  // Given a branch only on origin, git makes a local one tracking it.
+  const isKnown = (await has(`refs/heads/${branch}`)) || (await has(`refs/remotes/origin/${branch}`))
+
+  return gitDo(repo.dir, isKnown ? ['worktree', 'add', path, branch] : ['worktree', 'add', '-b', branch, path, repo.base])
 }
 
 // ---- Formatting ----
@@ -1534,6 +1574,18 @@ const App = ({ root }: { root: string }) => {
     }
   }
 
+  // Makes a worktree for the branch named and puts the cursor on it.
+  const createTree = async (branch: string) => {
+    if (!repo || !branch) return
+    const path = newTreePath(repo, branch)
+    setNotice(`Creating ${branch} at ${shortPath(path)}…`)
+    const failed = await addTree(repo, branch, path)
+    if (failed) return setNotice(`Couldn't create ${branch}: ${failed}`)
+    setCursors(cur => ({ ...cur, worktrees: `tree\t${path}` }))
+    refresh.current()
+    setNotice(`Created ${branch} at ${shortPath(path)}`)
+  }
+
   // A key typed while the footer asks a question: ⏎ answers, esc gives up, backspace and ctrl+u erase.
   const typeInPrompt = (input: string, key: { return: boolean; escape: boolean; backspace: boolean; delete: boolean; ctrl: boolean; meta: boolean }) => {
     const p = promptRef.current!
@@ -1624,6 +1676,7 @@ const App = ({ root }: { root: string }) => {
       const at = row?.file ? row : row && parentOf(row)
       if (at?.file) openInNvim(at.file, at.line ?? 1).then(setNotice)
     }
+    else if (input === 'n' && tab === 'worktrees' && repo) ask('new worktree for branch', createTree)
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
     else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
     else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)
@@ -1666,7 +1719,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · o nvim · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · n new · o nvim · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
