@@ -2,6 +2,7 @@
 import { closeSync, cpSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, resolve } from 'node:path'
+import hljs from 'highlight.js'
 import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
 import { useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
@@ -279,8 +280,21 @@ type Conflict = { merged: string; ours: string; theirs: string }
 // A diff to show under an open file, or with `isWhole` the file itself, or with `conflict` its conflicts, and where it comes from.
 type Wanted = { key: string; tree: string; file: string; commit?: string; isUntracked?: boolean; isWhole?: boolean; conflict?: Conflict }
 // `isUnreadable` when a whole file is binary, too large or missing; `colors` when the lines carry their own,
-// else they are coloured as a diff.
-type Diff = { lines: string[]; colors?: (string | undefined)[]; isCut: boolean; isUnreadable?: boolean; version: number }
+// else they are coloured as a diff. `tokens` are each line's code highlighted, when its language is known,
+// and `numbers` the line of the file each one is, for a conflict's lines.
+type Diff = {
+  lines: string[]
+  colors?: (string | undefined)[]
+  tokens?: (Token[] | undefined)[]
+  numbers?: number[]
+  isCut: boolean
+  isUnreadable?: boolean
+  version: number
+}
+
+// A piece of a highlighted line of code, and how it looks.
+type Token = { text: string; color?: string; isDim?: boolean; isItalic?: boolean; isBold?: boolean }
+type Style = Omit<Token, 'text'>
 
 type Tab = 'worktrees' | 'repo'
 
@@ -665,25 +679,36 @@ const readConflict = async (want: Wanted, conflict: Conflict) => {
     }
   })
 
+  const markers = all.map(line => line.match(/^(<{7}|\|{7}|={7}|>{7})( |$)/)?.[1])
+  // The code highlighted as one, both sides and all, with the marker lines left blank.
+  const highlighted = highlight(all.map((line, n) => (markers[n] ? '' : line)), languageOf(want.file, all[0]))
+
   const lines: string[] = []
   const colors: (string | undefined)[] = []
+  const tokens: (Token[] | undefined)[] = []
+  const numbers: number[] = []
   let side: string | undefined
   let last = -1
   all.forEach((line, n) => {
-    const marker = line.match(/^(<{7}|\|{7}|={7}|>{7})( |$)/)?.[1]
+    const marker = markers[n]
     if (kept.has(n)) {
       if (last !== -1 && n !== last + 1) {
         lines.push('…')
         colors.push(undefined)
+        tokens.push(undefined)
+        numbers.push(0)
       }
       last = n
       lines.push(marker === '<<<<<<<' ? `${marker} ${conflict.ours}` : marker === '>>>>>>>' ? `${marker} ${conflict.theirs}` : line)
       colors.push(marker ? 'cyan' : side)
+      tokens.push(marker ? undefined : highlighted?.[n])
+      numbers.push(n + 1)
     }
     if (marker) side = marker[0] === '<' ? 'blue' : marker[0] === '|' ? 'gray' : marker[0] === '=' ? 'magenta' : undefined
   })
+  const cut = <T,>(list: T[]) => list.slice(0, MAX_DIFF_LINES)
 
-  return { lines: lines.slice(0, MAX_DIFF_LINES), colors: colors.slice(0, MAX_DIFF_LINES), isCut: lines.length > MAX_DIFF_LINES }
+  return { lines: cut(lines), colors: cut(colors), tokens: cut(tokens), numbers: cut(numbers), isCut: lines.length > MAX_DIFF_LINES }
 }
 
 // A file's diff from its first hunk on, against HEAD when uncommitted or within its commit.
@@ -696,9 +721,10 @@ const readDiff = async (want: Wanted): Promise<Omit<Diff, 'version'>> => {
       : await git(want.tree, ['diff', 'HEAD', '--no-renames', '--', want.file])
   const lines = (text ?? '').replace(/\n$/, '').split('\n')
   const from = lines.findIndex(l => l.startsWith('@@'))
-  const body = from === -1 ? [] : lines.slice(from)
+  const body = (from === -1 ? [] : lines.slice(from)).slice(0, MAX_DIFF_LINES)
+  const isCut = from !== -1 && lines.length - from > MAX_DIFF_LINES
 
-  return { lines: body.slice(0, MAX_DIFF_LINES), isCut: body.length > MAX_DIFF_LINES }
+  return { lines: body, tokens: highlightDiff(body, languageOf(want.file, readFirstLine(`${want.tree}/${want.file}`))), isCut }
 }
 
 // What to show under an open file: its diff, or the file itself.
@@ -706,9 +732,10 @@ const readView = async (want: Wanted) => {
   if (!want.isWhole) return readDiff(want)
   const text = readText(`${want.tree}/${want.file}`)
   if (text === null) return { lines: [], isCut: false, isUnreadable: true }
-  const lines = toLines(text)
+  const all = toLines(text)
+  const lines = all.slice(0, MAX_FILE_LINES).map(l => l.replace(/\t/g, '    '))
 
-  return { lines: lines.slice(0, MAX_FILE_LINES), isCut: lines.length > MAX_FILE_LINES }
+  return { lines, tokens: highlight(lines, languageOf(want.file, lines[0])), isCut: all.length > MAX_FILE_LINES }
 }
 
 // The files of the worktree holding `root`, or failing that of the repository `findRepo` finds:
@@ -1579,6 +1606,189 @@ const sortTrees = (trees: Tree[], sort: Sort) =>
       b.lastAt - a.lastAt,
   )
 
+// ---- Highlighting ----
+
+// How each kind of token highlight.js finds looks, in kelp's colours. A kind given {} shows plain, as the code
+// inside a template string does, rather than taking on the colour of what holds it.
+const STYLES: Record<string, Style> = {
+  keyword: { color: 'magenta' },
+  'selector-tag': { color: 'magenta' },
+  'template-tag': { color: 'magenta' },
+  'variable.language': { color: 'magenta' },
+  built_in: { color: 'cyan' },
+  type: { color: 'cyan' },
+  'title.class': { color: 'cyan' },
+  title: { color: 'blue' },
+  name: { color: 'blue' },
+  attr: { color: 'blue' },
+  attribute: { color: 'blue' },
+  string: { color: 'green' },
+  code: { color: 'green' },
+  addition: { color: 'green' },
+  number: { color: 'yellow' },
+  literal: { color: 'yellow' },
+  symbol: { color: 'yellow' },
+  char: { color: 'yellow' },
+  bullet: { color: 'yellow' },
+  'variable.constant': { color: 'yellow' },
+  'selector-class': { color: 'yellow' },
+  'selector-id': { color: 'yellow' },
+  regexp: { color: 'red' },
+  deletion: { color: 'red' },
+  meta: { color: 'cyan' },
+  'selector-attr': { color: 'cyan' },
+  'selector-pseudo': { color: 'cyan' },
+  'template-variable': { color: 'cyan' },
+  link: { color: 'cyan' },
+  section: { color: 'blue', isBold: true },
+  strong: { isBold: true },
+  emphasis: { isItalic: true },
+  comment: { isDim: true, isItalic: true },
+  quote: { isDim: true, isItalic: true },
+  doctag: { isDim: true, isBold: true },
+  subst: {},
+  params: {},
+  variable: {},
+  property: {},
+}
+
+// A span's look from its class, such as "hljs-title function_", or nothing to take on the look of what holds it.
+const styleOf = (className: string): Style | undefined => {
+  const [kind, sub] = className.replace(/^hljs-/, '').split(' ')
+
+  return (sub && STYLES[`${kind}.${sub.replace(/_+$/, '')}`]) || STYLES[kind]
+}
+
+const ENTITIES: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#x27;': "'", '&#39;': "'" }
+
+// highlight.js's HTML as lines of tokens; a span still open at the end of a line, such as a long comment, goes on into the next.
+const parseHighlighted = (html: string) => {
+  const lines: Token[][] = [[]]
+  const open: Style[] = []
+  for (const [, className, close, text] of html.matchAll(/<span class="([^"]*)">|(<\/span>)|([^<]+)/g)) {
+    if (className !== undefined) open.push(styleOf(className) ?? open.at(-1) ?? {})
+    else if (close) open.pop()
+    else {
+      text.split('\n').forEach((part, k) => {
+        if (k > 0) lines.push([])
+        if (part) lines.at(-1)!.push({ text: part.replace(/&[#\w]+;/g, e => ENTITIES[e] ?? e), ...open.at(-1) })
+      })
+    }
+  }
+
+  return lines
+}
+
+// Files known by their name, then extensions highlight.js doesn't know as its own, and the programs a #! line names.
+const LANGUAGE_NAMES: Record<string, string> = {
+  dockerfile: 'dockerfile',
+  containerfile: 'dockerfile',
+  makefile: 'makefile',
+  gnumakefile: 'makefile',
+  'cmakelists.txt': 'cmake',
+  gemfile: 'ruby',
+  rakefile: 'ruby',
+  podfile: 'ruby',
+  vagrantfile: 'ruby',
+  '.bashrc': 'bash',
+  '.bash_profile': 'bash',
+  '.zshrc': 'bash',
+  '.profile': 'bash',
+  '.env': 'bash',
+  '.gitconfig': 'ini',
+  '.editorconfig': 'ini',
+}
+const LANGUAGE_EXTENSIONS: Record<string, string> = { jsonc: 'json', json5: 'json', jsonl: 'json', fish: 'bash', vue: 'xml', svelte: 'xml', mdx: 'markdown', lock: '' }
+const SHEBANGS: Record<string, string> = { node: 'javascript', bun: 'typescript', deno: 'typescript', sh: 'bash', dash: 'bash', zsh: 'bash', ksh: 'bash', fish: 'bash' }
+
+// The language highlight.js knows `file` by, from its name, its extension or a #! first line; undefined when none.
+const languageOf = (file: string, firstLine = '') => {
+  const name = basename(file).toLowerCase()
+  if (LANGUAGE_NAMES[name]) return LANGUAGE_NAMES[name]
+  if (name.startsWith('dockerfile') || name.endsWith('.dockerfile')) return 'dockerfile'
+  if (name.startsWith('.env.')) return 'bash'
+  const extension = name.includes('.') ? name.split('.').pop()! : ''
+  const known = extension in LANGUAGE_EXTENSIONS ? LANGUAGE_EXTENSIONS[extension] : extension && hljs.getLanguage(extension) ? extension : ''
+  if (known) return known
+  // "#!/usr/bin/env -S python3 -u" names python, as does "#!/usr/bin/python3".
+  const words = firstLine.match(/^#!\s*(.*)/)?.[1].split(/\s+/).filter(w => w && !w.startsWith('-')) ?? []
+  const program = basename((basename(words[0] ?? '') === 'env' ? words[1] : words[0]) ?? '').replace(/[\d.]+$/, '')
+  if (!program) return undefined
+
+  return SHEBANGS[program] ?? (hljs.getLanguage(program) ? program : undefined)
+}
+
+// The first line of a file, for its #!; '' when it can't be read.
+const readFirstLine = (file: string) => {
+  try {
+    const fd = openSync(file, 'r')
+    try {
+      const buffer = Buffer.alloc(256)
+      return buffer.subarray(0, readSync(fd, buffer, 0, 256, 0)).toString('utf8').split('\n')[0]
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+}
+
+// Highlighted texts by their language and a hash of the text, the latest used kept, so a file read again unchanged costs nothing.
+const highlights = new Map<string, Token[][]>()
+const MAX_HIGHLIGHTS = 200
+
+// The lines highlighted as `language`, read as one text; undefined with no language, or when highlight.js fails.
+const highlight = (lines: string[], language: string | undefined) => {
+  if (!language || lines.length === 0) return undefined
+  const text = lines.join('\n')
+  const key = `${language}\0${Bun.hash(text)}`
+  let found = highlights.get(key)
+  if (found) highlights.delete(key)
+  else {
+    try {
+      found = parseHighlighted(hljs.highlight(text, { language, ignoreIllegals: true }).value)
+    } catch {
+      return undefined
+    }
+    if (highlights.size >= MAX_HIGHLIGHTS) highlights.delete(highlights.keys().next().value!)
+  }
+  highlights.set(key, found)
+
+  return found
+}
+
+// A diff's lines highlighted: each hunk's unchanged and added lines, the code as it is now, read as one.
+// Removed lines and hunk headers have none, as they show in their own colour.
+const highlightDiff = (lines: string[], language: string | undefined) => {
+  if (!language) return undefined
+  const tokens: (Token[] | undefined)[] = lines.map(() => undefined)
+  let hunk: number[] = []
+  const finish = () => {
+    const found = highlight(hunk.map(n => lines[n].slice(1)), language)
+    hunk.forEach((n, k) => (tokens[n] = found?.[k]))
+    hunk = []
+  }
+  lines.forEach((line, n) => {
+    if (line.startsWith('@@')) finish()
+    else if (line.startsWith(' ') || line.startsWith('+')) hunk.push(n)
+  })
+  finish()
+
+  return tokens
+}
+
+// A line of code: its tokens, all dimmed with `isDim`, or with none its plain text.
+const codeNode = (text: string, tokens: Token[] | undefined, isDim = false) =>
+  tokens ? (
+    tokens.map((t, k) => (
+      <Text key={k} color={t.color} dimColor={isDim || t.isDim} italic={t.isItalic} bold={t.isBold}>
+        {t.text}
+      </Text>
+    ))
+  ) : (
+    <Text dimColor={isDim}>{text}</Text>
+  )
+
 // ---- Rows ----
 
 // Whether a `/` filter matches, as fzf does: each word of `query` must turn up, its letters in order but not
@@ -1601,14 +1811,59 @@ const isMatch = (query: string, fields: string[]) =>
       }),
     )
 
-// A diff's lines under the row `parent`, each knowing where it is in the new file; `colors` when they carry their own.
-const diffRows = (parent: string, file: string, lines: string[], depth: number, colors?: (string | undefined)[]): Row[] => {
-  const numbers = newLineNumbers(lines)
+// A diff's lines under the row `parent`, each knowing where it is in the new file. Each line starts with its number,
+// of the old file for a removed one, then its sign: added lines green with their code highlighted, removed ones red,
+// unchanged ones dimmed. A conflict's lines (`colors` set) are marked by the side they come from.
+const diffRows = (parent: string, file: string, diff: Pick<Diff, 'lines' | 'colors' | 'tokens' | 'numbers'>, depth: number): Row[] => {
+  const { lines, colors, tokens } = diff
+  const numbers = diff.numbers ?? newLineNumbers(lines)
+  // The number each line shows: in the old file for a removed line, else the new; 0 for none.
+  let old = 1
+  const shown = diff.numbers ?? lines.map((line, n) => {
+    const hunk = line.match(/^@@ -(\d+)/)
+    if (hunk) old = Number(hunk[1])
+    if (hunk || line.startsWith('\\')) return 0
+    if (line.startsWith('+')) return numbers[n]
+    const at = old++
+
+    return line.startsWith('-') ? at : numbers[n]
+  })
+  const width = String(Math.max(0, ...shown)).length
 
   return lines.map((line, n) => {
-    const color = colors ? colors[n] : line.startsWith('+') ? 'green' : line.startsWith('-') ? 'red' : line.startsWith('@@') ? 'cyan' : undefined
+    const number = shown[n] ? String(shown[n]).padStart(width) : ' '.repeat(width)
+    let node: JSX.Element
+    if (colors) {
+      const side = colors[n]
+      node =
+        side === 'cyan' || !shown[n] ? (
+          <Text color={side} dimColor={!side} wrap="truncate-end">{' '.repeat(width + 3)}{line}</Text>
+        ) : (
+          <Text wrap="truncate-end">
+            <Text dimColor>{number} </Text>
+            <Text color={side}>{side ? '▌' : ' '}</Text> {codeNode(line, tokens?.[n], !side || side === 'gray')}
+          </Text>
+        )
+    } else if (line.startsWith('@@')) {
+      node = <Text color="cyan" wrap="truncate-end">{line}</Text>
+    } else if (line.startsWith('+') || line.startsWith('-')) {
+      const color = line[0] === '+' ? 'green' : 'red'
+      node = (
+        <Text wrap="truncate-end">
+          <Text color={color}>{number} {line[0]}</Text> {line[0] === '+' ? codeNode(line.slice(1), tokens?.[n]) : <Text color="red">{line.slice(1)}</Text>}
+        </Text>
+      )
+    } else if (line.startsWith(' ')) {
+      node = (
+        <Text wrap="truncate-end">
+          <Text dimColor>{number}  </Text> {codeNode(line.slice(1), tokens?.[n], true)}
+        </Text>
+      )
+    } else {
+      node = <Text dimColor wrap="truncate-end">{line || ' '}</Text>
+    }
 
-    return { key: `${parent}\t${n}`, parent, depth, file, line: numbers[n], node: <Text color={color} dimColor={!color} wrap="truncate-end">{line || ' '}</Text> }
+    return { key: `${parent}\t${n}`, parent, depth, file, line: numbers[n] || undefined, node }
   })
 }
 
@@ -1714,7 +1969,7 @@ const buildRows = (
 
       return note(`${key}\tempty`, key, 3, empty)
     }
-    rows.push(...diffRows(key, file, diff.lines, 3, diff.colors))
+    rows.push(...diffRows(key, file, diff, 3))
     if (diff.isCut) note(`${key}\tcut`, key, 3, `… diff cut at ${MAX_DIFF_LINES} lines`)
   }
 
@@ -2022,7 +2277,7 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
         note(`${view}\tunreadable`, key, depth + 1, `Not shown: binary, over ${MAX_FILE / 1_000_000} MB, or missing.`)
       } else if (isDiff) {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'No changes since the last commit.')
-        rows.push(...diffRows(key, path, shown.lines, depth + 1))
+        rows.push(...diffRows(key, path, shown, depth + 1))
         if (shown.isCut) note(`${view}\tcut`, key, depth + 1, `… diff cut at ${MAX_DIFF_LINES} lines`)
       } else {
         if (shown.lines.length === 0) note(`${view}\tempty`, key, depth + 1, 'Empty file.')
@@ -2036,8 +2291,8 @@ const buildRepoRows = (files: Files, isOpen: (key: string, byDefault: boolean) =
             line: n + 1,
             node: (
               <Text wrap="truncate-end">
-                <Text dimColor>{String(n + 1).padStart(gutter)} </Text>
-                {line.replace(/\t/g, '    ') || ' '}
+                <Text dimColor>{String(n + 1).padStart(gutter)}  </Text>
+                {codeNode(line, shown.tokens?.[n])}
               </Text>
             ),
           })
