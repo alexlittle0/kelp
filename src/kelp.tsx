@@ -88,6 +88,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     area: 'agents',
     keys: [
       ['t', 'jump to the worktree: its tmux pane, else a new window there'],
+      ['a', 'start claude in the worktree, in a new window'],
     ],
   },
   {
@@ -723,6 +724,14 @@ const jumpTo = async (tree: Tree) => {
   const where = await openWindow(tree.path, name)
 
   return where ? `Opened ${name} in ${where}` : `Couldn't open a window in ${shortPath(tree.path)}`
+}
+
+// Starts claude in the worktree, in a new window named "<branch> claude". Says where.
+const startClaude = async (tree: Tree) => {
+  const name = `${label(tree)} claude`
+  const where = await openWindow(tree.path, name, ['claude'])
+
+  return where ? `Started claude in ${label(tree)}, in ${where} "${name}"` : `Couldn't start claude in ${shortPath(tree.path)}`
 }
 
 // ---- GitHub ----
@@ -1887,9 +1896,9 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'm' && tab === 'worktrees') act('land')
     else if (input === 'c' && !key.ctrl) commitAll()
     else if (input === 'D') discard()
-    else if (input === 't') {
+    else if (input === 't' || input === 'a') {
       const tree = treeUnder()
-      if (tree) jumpTo(tree).then(text => {
+      if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree)).then(text => {
         setNotice(text)
         refresh.current()
       })
@@ -1982,7 +1991,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · n new · o nvim · t tmux · ! : run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit${discardKey} · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `⏎ open · n new · t tmux · a claude · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''} · c commit · u merge ${repo?.base ?? 'base'} in · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
