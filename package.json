@@ -1,0 +1,22 @@
+{
+  "name": "kelp",
+  "version": "0.1.0",
+  "description": "Every git worktree of a repository in one live view: its commits, its uncommitted changes and their diffs",
+  "type": "module",
+  "private": true,
+  "bin": { "kelp": "src/kelp.tsx" },
+  "scripts": {
+    "start": "bun src/kelp.tsx",
+    "build": "bun build src/kelp.tsx --compile --outfile dist/kelp",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^6.0.0",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.8.0"
+  }
+}
