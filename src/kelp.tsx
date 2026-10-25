@@ -160,7 +160,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['a', 'start claude in the worktree, in a new window'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's claude (in the agents tab, the one under the cursor), in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
+      ['>', "reply: type a message into the worktree's agent (in the agents tab, the one under the cursor), in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
     ],
   },
   {
@@ -3432,39 +3432,39 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setNotice(`◆ ${agent.name} in ${label(next)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''} · A again for its tmux pane`)
   }
 
-  // `>`: asks for a message and types it into the tmux pane of the worktree's claude, the one waiting for the person
-  // first, else an idle one, else one at work, which takes it once its turn is done. Says why when there is no pane to send to.
+  // `>`: asks for a message and types it into the tmux pane of the worktree's agent, claude or any other, the one
+  // under the cursor in the agents tab, else the one waiting for the person first, else an idle one, else one at work,
+  // which takes it once its turn is done. Says why when there is no pane to send to.
   // On a line of a diff or file it asks for a review note instead, sent as "<file>:<line>: <note>".
   const reply = async () => {
     const tree = treeUnder()
-    if (!repo || !tree) return setNotice('Move to a worktree to answer its claude.')
+    if (!repo || !tree) return setNotice('Move to a worktree to answer its agent.')
     const name = label(tree)
-    const claudes = tree.agents.filter(a => a.name === 'claude')
-    const under = agentUnder()
-    const agent = (under?.name === 'claude' ? under : undefined) ?? claudes.find(a => a.isWaiting) ?? claudes.find(a => a.isBusy === false) ?? claudes[0]
-    if (!agent) return setNotice(`No claude runs in ${name}, so there is nothing to send to: a starts one.`)
-    if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to claude in ${name} through.`)
+    const agent = agentUnder() ?? tree.agents.find(a => a.isWaiting) ?? tree.agents.find(a => a.isBusy === false) ?? tree.agents[0]
+    if (!agent) return setNotice(`No agent runs in ${name}, so there is nothing to send to: a starts claude.`)
+    const who = `${agent.name} in ${name}`
+    if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to ${who} through.`)
     const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
-    if (!pane) return setNotice(`claude in ${name} runs in no tmux pane kelp can see, so there is nowhere to send to.`)
+    if (!pane) return setNotice(`${who} runs in no tmux pane kelp can see, so there is nowhere to send to.`)
     const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
     // A line under a file, not the file's own line, which opens and closes.
     const at = row?.file && !row.canOpen && row.file.startsWith(`${tree.path}/`) ? `${row.file.slice(tree.path.length + 1)}:${row.line ?? 1}` : ''
-    // Asking leave to run a tool, its menu wants yes or no, not free text; a note goes with a no.
-    if (agent.isAsking || (await isAskingIn('claude', pane))) {
+    // Asking leave to run something, its menu or prompt wants yes or no, not free text; a note goes with a no.
+    if (agent.isAsking || (await isAskingIn(agent.name, pane))) {
       const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
-      return ask(`claude in ${name} asks to run ${asks.length > 50 ? `${asks.slice(0, 49)}…` : asks} · allow? y/n, or n and what to do instead:`, async answer => {
+      return ask(`${who} asks to run ${asks.length > 50 ? `${asks.slice(0, 49)}…` : asks} · allow? y/n, or n and what to do instead:`, async answer => {
         const no = answer.match(/^no?(?:\s+|$)(.*)$/i)
         if (!/^y(es)?$/i.test(answer) && !no) return setNotice('Nothing sent: answer y or n.')
         const instead = no?.[1] && at ? `${at}: ${no[1]}` : (no?.[1] ?? '')
-        const isSent = await answerAsking('claude', pane, !no, instead)
-        setNotice(!isSent ? `Couldn't send keys to tmux pane ${pane.id}.` : no ? `Told claude in ${name} no${instead ? ', and what to do instead' : ''}.` : `Allowed claude in ${name} to run ${asks}.`)
+        const isSent = await answerAsking(agent.name, pane, !no, instead)
+        setNotice(!isSent ? `Couldn't send keys to tmux pane ${pane.id}.` : no ? `Told ${who} no${instead ? ', and what to do instead' : ''}.` : `Allowed ${who} to run ${asks}.`)
         refresh.current()
       })
     }
-    ask(at ? `note on ${at} for claude in ${name} (${state}):` : `reply to claude in ${name} (${state}):`, async text => {
+    ask(at ? `note on ${at} for ${who} (${state}):` : `reply to ${who} (${state}):`, async text => {
       if (!text) return
       const isSent = await typeInto(pane, at ? `${at}: ${text}` : text)
-      setNotice(isSent ? `Sent to claude in ${name}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
+      setNotice(isSent ? `Sent to ${who}, tmux pane ${pane.id}.` : `Couldn't type into tmux pane ${pane.id}.`)
       refresh.current()
     })
   }
@@ -4212,8 +4212,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const cursorTree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
   const mergeKeys = cursorTree?.isMerging ? 'u commit merge · U abort' : cursorTree?.isRebasing ? 'R carry on · U abort' : `u merge ${repo?.base ?? 'base'} in`
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
-  // Answering is offered where a claude waits for the person.
-  const replyKey = (tab === 'agents' ? agentUnder()?.name === 'claude' : treeUnder()?.agents.some(a => a.name === 'claude' && a.isWaiting)) ? ' · > reply' : ''
+  // Answering is offered where an agent waits for the person.
+  const replyKey = (tab === 'agents' ? agentUnder() : treeUnder()?.agents.some(a => a.isWaiting)) ? ' · > reply' : ''
   const keys = isHelp
     ? `? esc close${helpLines.length > height ? ' · j k scroll' : ''}`
     : tab === 'repo'
