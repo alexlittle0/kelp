@@ -98,6 +98,14 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     ],
   },
   {
+    area: 'remote',
+    keys: [
+      ['p', 'push the branch, setting its upstream the first time'],
+      ['P', 'push and open a pull request with gh (twice)'],
+      ['b', 'open its pull request, or branch, on GitHub'],
+    ],
+  },
+  {
     area: 'kelp',
     keys: [
       ['r', 'refresh now'],
@@ -1560,6 +1568,57 @@ const App = ({ root }: { root: string }) => {
     })
   }
 
+  // Pushes the worktree's branch, setting its upstream on the remote the first time; true when it went.
+  const push = async (tree: Tree) => {
+    if (!repo) return false
+    const name = label(tree)
+    setNotice(`Pushing ${name} to ${repo.remote}…`)
+    const run = await runCommand(tree.path, tree.upstream ? ['git', 'push'] : ['git', 'push', '-u', repo.remote, tree.branch])
+    await refresh.current()
+    if (run?.code === 0) setNotice(`Pushed ${name} to ${repo.remote}.`)
+    else setNotice(`Couldn't push ${name}: ${run ? whyFailed(run.err) : 'git did not start'}`)
+
+    return run?.code === 0
+  }
+
+  // What `p`, `P` and `b` do to the worktree under the cursor: push its branch, open a pull request for it
+  // with gh (on a second press, pushing first when needed), or show its pull request or branch on GitHub.
+  const remoteAct = (kind: 'push' | 'pr' | 'browse') => {
+    const tree = repo?.trees.find(t => row?.key.split('\t')[1] === t.path)
+    if (!repo || !tree) return
+    const name = label(tree)
+    const pr = tree.isBase ? undefined : prs.get(tree.branch)
+    const needsPush = !tree.upstream || tree.unpushed > 0 || tree.isUpstreamGone
+    if (kind === 'browse') {
+      if (pr) return setNotice(openInBrowser(pr.url))
+      if (!repo.github) return setNotice(repo.remote ? `${repo.remote} is not on GitHub.` : 'This repository has no remote.')
+      const branch = tree.upstream.startsWith(`${repo.remote}/`) && !tree.isUpstreamGone ? tree.upstream.slice(repo.remote.length + 1) : ''
+
+      return setNotice(openInBrowser(branch ? `${repo.github}/tree/${encodeURI(branch)}` : repo.github))
+    }
+    if (!repo.remote) return setNotice('This repository has no remote to push to.')
+    if (!tree.branch) return setNotice(`${name} is not on a branch.`)
+    if (kind === 'push') {
+      if (!needsPush) return setNotice(`${name} is already pushed.`)
+      return void push(tree)
+    }
+    if (!repo.github) return setNotice(`${repo.remote} is not on GitHub.`)
+    if (tree.isBase) return setNotice(`${name} is the base branch.`)
+    if (pr && (pr.state === 'open' || pr.state === 'draft')) return setNotice(`${name} already has pull request #${pr.number}: b opens it.`)
+    if (tree.ahead === 0) return setNotice(`${name} has nothing ahead of ${repo.base} to propose.`)
+
+    confirm('P', `${needsPush ? `Push ${name} and open` : 'Open'} a pull request from ${name} into ${repo.base} with gh pr create --fill`, async () => {
+      if (needsPush && !(await push(tree))) return
+      setNotice(`Opening a pull request for ${name}…`)
+      const slug = repo.github.replace('https://github.com/', '')
+      const run = await runCommand(tree.path, ['gh', 'pr', 'create', '--fill', '--repo', slug, '--base', repo.base, '--head', tree.branch])
+      if (!run) return setNotice('gh is not installed: see https://cli.github.com')
+      if (run.code !== 0) return setNotice(`Couldn't open the pull request: ${whyFailed(run.err)}`)
+      setNotice(`Opened ${run.out.trim().split('\n').pop()}`)
+      fetchPrs.current()
+    })
+  }
+
   // Asks `label` in the footer, then calls `onDone` with the answer, unless esc is pressed.
   const ask = (label: string, onDone: (answer: string) => void, text = '') => setPrompt({ label, text, onDone })
 
@@ -1661,6 +1720,9 @@ const App = ({ root }: { root: string }) => {
     else if (input === 'q') exit()
     else if (input === 'u' && !key.ctrl && tab === 'worktrees') act('merge')
     else if (input === 'U' && tab === 'worktrees') act('abort')
+    else if (input === 'p' && tab === 'worktrees') remoteAct('push')
+    else if (input === 'P' && tab === 'worktrees') remoteAct('pr')
+    else if (input === 'b' && tab === 'worktrees') remoteAct('browse')
     else if (input === 'r') refresh.current()
     else if (input === '!') {
       const tree = treeAtCursor()
@@ -1719,7 +1781,7 @@ const App = ({ root }: { root: string }) => {
     ? '? esc close'
     : tab === 'repo'
       ? `↑↓ move · ⏎ open/close · d ${isDiff ? 'files' : 'diffs'} · o nvim · tab worktrees · ? keys · q quit`
-      : `↑↓ move · ⏎ open/close · n new · o nvim · ! run · u merge ${repo?.base ?? 'base'} in · tab repo · ? keys · q quit`
+      : `↑↓ move · ⏎ open/close · n new · o nvim · ! run · u merge ${repo?.base ?? 'base'} in${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR · b GitHub' : ''} · tab repo · ? keys · q quit`
   // The width of the widest key, so every area's descriptions line up.
   const keyWidth = Math.max(...KEYS.flatMap(a => a.keys.map(([k]) => k.length)))
   const help = (
