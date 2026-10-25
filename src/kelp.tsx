@@ -124,6 +124,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['t', 'jump to the worktree: its tmux pane, else a new window there'],
       ['a', 'start claude in the worktree, in a new window'],
+      ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
     ],
   },
@@ -983,12 +984,13 @@ const jumpTo = async (tree: Tree) => {
   return where ? `Opened ${name} in ${where}` : `Couldn't open a window in ${shortPath(tree.path)}`
 }
 
-// Starts claude in the worktree, in a new window named "<branch> claude". Says where.
-const startClaude = async (tree: Tree) => {
-  const name = `${label(tree)} claude`
-  const where = await openWindow(tree.path, name, ['claude'])
+// Starts claude in the worktree at `path` named `branch`, given `prompt` to begin with when there is one,
+// in a new window named "<branch> claude". Says where.
+const startClaude = async (path: string, branch: string, prompt = '') => {
+  const name = `${branch} claude`
+  const where = await openWindow(path, name, prompt ? ['claude', prompt] : ['claude'])
 
-  return where ? `Started claude in ${label(tree)}, in ${where} "${name}"` : `Couldn't start claude in ${shortPath(tree.path)}`
+  return where ? `Started claude in ${branch}, in ${where} "${name}"` : `Couldn't start claude in ${shortPath(path)}`
 }
 
 // ---- GitHub ----
@@ -2435,24 +2437,34 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
   // Makes a worktree for the branch named and puts the cursor on it, then readies it: copies the main worktree's
   // ignored local files it needs and runs .kelp.json's postCreate commands, saying how far it has got under its line.
+  // Its folder once made, readied or not, else null.
   const createTree = async (branch: string) => {
-    if (!repo || !branch) return
+    if (!repo || !branch) return null
     const path = newTreePath(repo, branch)
     const main = repo.trees.find(t => t.isMain)?.path ?? repo.dir
     setNotice(`Creating ${branch} at ${shortPath(path)}…`)
     const failed = await addTree(repo, branch, path)
-    if (failed) return setNotice(`Couldn't create ${branch}: ${failed}`)
+    if (failed) {
+      setNotice(`Couldn't create ${branch}: ${failed}`)
+      return null
+    }
     setCursors(cur => ({ ...cur, worktrees: `tree\t${path}` }))
     refresh.current()
 
     const config = readConfig(main)
-    if (config.error) return setJob(path, { text: config.error, isFailed: true })
+    if (config.error) {
+      setJob(path, { text: config.error, isFailed: true })
+      return path
+    }
     const files = await localFiles(main, config.copy)
     const done = [`Created ${branch}`]
     if (files.length > 0) {
       setJob(path, { text: `Copying ${files.join(', ')}…` })
       const why = copyFiles(main, path, files)
-      if (why) return setJob(path, { text: `Couldn't copy the local files: ${why}`, isFailed: true })
+      if (why) {
+        setJob(path, { text: `Couldn't copy the local files: ${why}`, isFailed: true })
+        return path
+      }
       done.push(`copied ${files.join(', ')}`)
     }
     for (const command of config.postCreate) {
@@ -2460,13 +2472,30 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       const run = await runCommand(path, ['sh', '-c', command])
       if (run?.code !== 0) {
         const why = run ? `exit ${run.code}: ${whyFailed(run.err || run.out)}` : "couldn't start"
-        return setJob(path, { text: `${command} failed (${why})`, isFailed: true })
+        setJob(path, { text: `${command} failed (${why})`, isFailed: true })
+        return path
       }
       done.push(`ran ${command}`)
     }
     setJob(path)
     setNotice(done.join(', '))
+
+    return path
   }
+
+  // N: asks for a branch, then for what claude should do there; makes the worktree as `n` does,
+  // then starts claude in it with that prompt, once the worktree is readied.
+  const newTask = () =>
+    ask('new task on branch', branch => {
+      if (!branch) return
+      ask(`task for claude in ${branch}:`, async task => {
+        if (!task) return setNotice('No task started: the prompt was empty.')
+        const path = await createTree(branch)
+        if (!path) return
+        setNotice(await startClaude(path, branch, task))
+        refresh.current()
+      })
+    })
 
   // The path of what the cursor is on: a file (or a line of it), a folder in the repo tab, else its worktree.
   const pathUnder = () => {
@@ -2715,7 +2744,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'A') nextWaiting()
     else if (input === 't' || input === 'a') {
       const tree = treeUnder()
-      if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree)).then(text => {
+      if (tree) (input === 't' ? jumpTo(tree) : startClaude(tree.path, label(tree))).then(text => {
         setNotice(text)
         refresh.current()
       })
@@ -2773,6 +2802,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       if (at?.file) openInNvim(at.file, at.line ?? 1).then(setNotice)
     }
     else if (input === 'n' && tab === 'worktrees' && repo) ask('new worktree for branch', createTree)
+    else if (input === 'N' && tab === 'worktrees' && repo) newTask()
     else if ((input === 'x' || input === 'X') && tab === 'worktrees') removeTree(input === 'X')
     else if (input === 'C' && tab === 'worktrees') cleanUp()
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
