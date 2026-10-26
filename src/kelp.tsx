@@ -304,7 +304,11 @@ type Ending = { kind: 'done' | 'tool' | 'stopped' | 'working'; at: number; tool?
 type Pane = { id: string; window: string; windowName: string; command: string; pid: number }
 
 // `remote` is the one to push to ('' when there is none), `github` its page on GitHub ('' when it is not there).
-type Repo = { dir: string; base: string; remote: string; github: string; trees: Tree[] }
+// `away` holds the agents running anywhere else on the machine, by their folder, and `panes` every tmux pane kelp sees.
+type Repo = { dir: string; base: string; remote: string; github: string; trees: Tree[]; away: Place[]; panes: Pane[] }
+
+// A folder outside the repository that agents run in, and the tmux panes in it; a worktree is one too.
+type Place = { path: string; agents: Agent[]; panes: Pane[] }
 
 // A branch's pull request on GitHub: its review decision ('' when none is needed), its checks rolled up into one
 // ('' when it has none) and the names of those failing.
@@ -724,23 +728,38 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const [trees, panes, stashes] = await Promise.all([Promise.all(worktrees.map(w => loadTree(w, base, upstreams))), listPanes(), readStashes(dir, worktrees.map(w => w.branch))])
   trees.sort((a, b) => Number(b.isBase) - Number(a.isBase) || label(a).localeCompare(label(b)))
   for (const tree of trees) tree.stashes = (tree.branch && stashes.get(tree.branch)) || []
+  // An agent in no worktree goes in `away` under its own folder, so the agents tab shows every one on the machine.
+  const away: Place[] = []
   for (const agent of findAgents()) {
     const { cwd, ...rest } = agent
-    treeAt(trees, cwd)?.agents.push(rest)
+    const tree = treeAt(trees, cwd)
+    if (tree) {
+      tree.agents.push(rest)
+      continue
+    }
+    let place = away.find(p => p.path === cwd)
+    if (!place) {
+      place = { path: cwd, agents: [], panes: [] }
+      away.push(place)
+    }
+    place.agents.push(rest)
   }
-  for (const { path, ...pane } of panes) treeAt(trees, path)?.panes.push(pane)
+  away.sort((a, b) => a.path.localeCompare(b.path))
+  for (const { path, ...pane } of panes) (treeAt(trees, path) ?? treeAt(away, path))?.panes.push(pane)
+  const allPanes = panes.map(({ path, ...pane }) => pane)
+  const allAgents = [...trees, ...away].flatMap(p => p.agents)
   // A claude showing its menu asking leave to run a tool looks busy in its transcript, which gets the tool call
   // only once it is answered; so the pane of each busy one is read, once a refresh, and one asking is waiting.
-  const busy = trees.flatMap(t => t.agents).filter(a => a.name === 'claude' && a.isBusy)
+  const busy = allAgents.filter(a => a.name === 'claude' && a.isBusy)
   await Promise.all(busy.map(async agent => {
-    const pane = paneOf(panes, agent.pid)
+    const pane = paneOf(allPanes, agent.pid)
     if (pane && (await isAskingIn('claude', pane))) Object.assign(agent, { isBusy: false, isWaiting: true, isAsking: true, turnAt: undefined })
   }))
   // The other agents have no transcript kelp reads, so each one's pane is read instead, once a refresh: at work,
   // asking leave, done and so waiting for a while after it was last at work, or else idle.
-  const others = trees.flatMap(t => t.agents).filter(a => a.name !== 'claude')
+  const others = allAgents.filter(a => a.name !== 'claude')
   await Promise.all(others.map(async agent => {
-    const pane = paneOf(panes, agent.pid)
+    const pane = paneOf(allPanes, agent.pid)
     const state = pane && (await paneState(agent.name, pane))
     if (!state) return
     if (state === 'busy') busyAt.set(agent.pid, Date.now())
@@ -758,7 +777,7 @@ const loadRepo = async (root: string): Promise<Repo | null> => {
   const isMainPortUsed = isPortIn(main)
   for (const tree of trees) tree.isPortUsed = isMainPortUsed || isPortIn(tree.path)
 
-  return { dir, base, remote, github: githubPage(url), trees }
+  return { dir, base, remote, github: githubPage(url), trees, away, panes: allPanes }
 }
 
 // A conflicted file's conflicts, each with a few lines around it, runs apart split by "…". The worktree's side
@@ -1272,9 +1291,10 @@ const openWindow = async (dir: string, name: string, command: string[] = []) => 
   return (await succeeds(['setsid', '-f', 'kitty', '--directory', dir, '--title', name, ...command])) ? 'a new kitty window' : null
 }
 
-// Brings forward a tmux pane in the worktree, `pane` when given, or failing that opens a new window there named after its branch. Says what happened.
-const jumpTo = async (tree: Tree, pane: Pane | undefined = tree.panes[0]) => {
-  const name = label(tree)
+// Brings forward a tmux pane in the worktree or folder, `pane` when given, or failing that opens a new window there
+// named after its branch or folder. Says what happened.
+const jumpTo = async (tree: Place, pane: Pane | undefined = tree.panes[0]) => {
+  const name = placeName(tree)
   if (pane && (await succeeds(['tmux', 'select-window', '-t', pane.id])) && (await succeeds(['tmux', 'select-pane', '-t', pane.id]))) {
     // Only needed when the pane is in another session.
     await succeeds(['tmux', 'switch-client', '-t', pane.id])
@@ -1936,6 +1956,9 @@ const planCleanup = (repo: Repo, root: string) => ({
 // ---- Formatting ----
 
 const label = (tree: Tree) => tree.branch || `detached ${tree.head.slice(0, 7)}`
+
+// What a place agents run in is called: a worktree by its branch, a folder outside the repository by its path.
+const placeName = (place: Place) => ('branch' in place ? label(place as Tree) : shortPath(place.path))
 
 const shortPath = (file: string) => file.replace(homedir(), '~')
 
@@ -2653,87 +2676,7 @@ const buildRows = (
       }
     }
 
-    // Each claude's conversation, closed: its latest entries, newest at the bottom. A prompt (bold) or reply shows
-    // its first lines until opened; a tool call is one dim line, opening to its input and the start of its result.
-    const claudes = tree.agents.filter(a => a.turns)
-    for (const agent of claudes) {
-      const group = `${key}\tchat\t${agent.session}`
-      const isChatOpen = isOpen(group, false)
-      const state = agent.isWaiting ? { text: 'waiting', color: 'yellow' } : agent.isBusy ? { text: 'working', color: 'green' } : { text: 'idle' }
-      rows.push({
-        key: group,
-        parent: key,
-        depth: 1,
-        canOpen: true,
-        node: (
-          <Text wrap="truncate-end">
-            <Text dimColor>{isChatOpen ? '▾' : '▸'} </Text>
-            claude conversation
-            <Text dimColor>{claudes.length > 1 ? ` · ${agent.session}` : ''} · </Text>
-            <Text color={state.color} dimColor={!state.color}>{state.text}</Text>
-          </Text>
-        ),
-      })
-      if (!isChatOpen) continue
-      // The latest entries, the earlier ones folded away so the end shows.
-      const earlier = `${group}\tearlier`
-      const hidden = Math.max(0, agent.turns!.length - RECENT_TURNS)
-      const turns = hidden > 0 && !isOpen(earlier, false) ? agent.turns!.slice(hidden) : agent.turns!
-      if (agent.turns!.length === 0) note(`${group}\tnone`, group, 2, 'Nothing said yet.')
-      if (hidden > 0) {
-        rows.push({ key: earlier, parent: group, depth: 2, canOpen: true, node: <Text dimColor wrap="truncate-end">{isOpen(earlier, false) ? '▾' : '▸'} {hidden} earlier {hidden === 1 ? 'entry' : 'entries'}</Text> })
-      }
-      // Paths in the worktree are shown from its folder.
-      const here = (text: string) => shortPath(text.replaceAll(`${tree.path}/`, ''))
-      const width = Math.max(10, room(2) - 2)
-      for (const turn of turns) {
-        const at = `${group}\t${turn.key}`
-        if (turn.kind === 'tool') {
-          const isTurnOpen = isOpen(at, false)
-          rows.push({
-            key: at,
-            parent: group,
-            depth: 2,
-            canOpen: true,
-            // The file it read or edited, which `o` and `e` open, from its lines too.
-            ...(turn.file && { file: turn.file, line: 1 }),
-            node: (
-              <Text wrap="truncate-end">
-                <Text dimColor>{isTurnOpen ? '▾' : '▸'} {here(turn.text)}</Text>
-                {turn.isFailed && <Text color="red"> ✗</Text>}
-              </Text>
-            ),
-          })
-          if (!isTurnOpen) continue
-          turn.input?.forEach((line, n) => note(`${at}\tin${n}`, at, 3, here(line)))
-          if (!turn.result) note(`${at}\tpending`, at, 3, 'No result yet.')
-          turn.result?.forEach((line, n) => {
-            rows.push({ key: `${at}\tout${n}`, parent: at, depth: 3, node: <Text color={turn.isFailed ? 'red' : undefined} dimColor={!turn.isFailed} wrap="truncate-end">{n === 0 ? '→ ' : '  '}{line || ' '}</Text> })
-          })
-          if (turn.more) note(`${at}\tmore`, at, 3, `  … ${plural(turn.more, 'more line')}`)
-          continue
-        }
-        const lines = wrapText(turn.text, width)
-        const canOpen = lines.length > REPLY_LINES
-        const isTurnOpen = canOpen && isOpen(at, false)
-        const shown = isTurnOpen ? lines : lines.slice(0, REPLY_LINES)
-        shown.forEach((line, n) => {
-          rows.push({
-            key: n === 0 ? at : `${at}\t${n}`,
-            parent: n === 0 || !canOpen ? group : at,
-            depth: 2,
-            canOpen: n === 0 && canOpen,
-            node: (
-              <Text wrap="truncate-end">
-                <Text dimColor>{n === 0 && canOpen ? (isTurnOpen ? '▾ ' : '▸ ') : '  '}</Text>
-                <Text bold={turn.kind === 'prompt'}>{line}</Text>
-                {canOpen && !isTurnOpen && n === shown.length - 1 && <Text dimColor> …</Text>}
-              </Text>
-            ),
-          })
-        })
-      }
-    }
+    rows.push(...chatRows(tree.agents, key, 1, tree.path, columns, isOpen, false))
 
     if (uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
@@ -2771,6 +2714,97 @@ const statusOf = (code: string) =>
   : code.includes('D') ? { text: 'deleted', color: 'red' }
   : code.includes('A') ? { text: 'new', color: 'blue' }
   : { text: 'modified', color: 'yellow' }
+
+// The rows of each claude's conversation among `agents`, under the row `parent` at `depth`, closed unless
+// `isOpenByDefault`: its latest entries, newest at the bottom. A prompt (bold) or reply shows its first lines until
+// opened; a tool call is one dim line, opening to its input and the start of its result. Paths in `folder` show from it.
+const chatRows = (agents: Agent[], parent: string, depth: number, folder: string, columns: number, isOpen: (key: string, byDefault: boolean) => boolean, isOpenByDefault: boolean) => {
+  const rows: Row[] = []
+  const note = (key: string, parent: string, depth: number, text: string) =>
+    rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
+  const claudes = agents.filter(a => a.turns)
+  const inner = depth + 1
+  for (const agent of claudes) {
+    const group = `${parent}\tchat\t${agent.session}`
+    const isChatOpen = isOpen(group, isOpenByDefault)
+    const state = agent.isWaiting ? { text: 'waiting', color: 'yellow' } : agent.isBusy ? { text: 'working', color: 'green' } : { text: 'idle' }
+    rows.push({
+      key: group,
+      parent,
+      depth,
+      canOpen: true,
+      node: (
+        <Text wrap="truncate-end">
+          <Text dimColor>{isChatOpen ? '▾' : '▸'} </Text>
+          claude conversation
+          <Text dimColor>{claudes.length > 1 ? ` · ${agent.session}` : ''} · </Text>
+          <Text color={state.color} dimColor={!state.color}>{state.text}</Text>
+        </Text>
+      ),
+    })
+    if (!isChatOpen) continue
+    // The latest entries, the earlier ones folded away so the end shows.
+    const earlier = `${group}\tearlier`
+    const hidden = Math.max(0, agent.turns!.length - RECENT_TURNS)
+    const turns = hidden > 0 && !isOpen(earlier, false) ? agent.turns!.slice(hidden) : agent.turns!
+    if (agent.turns!.length === 0) note(`${group}\tnone`, group, inner, 'Nothing said yet.')
+    if (hidden > 0) {
+      rows.push({ key: earlier, parent: group, depth: inner, canOpen: true, node: <Text dimColor wrap="truncate-end">{isOpen(earlier, false) ? '▾' : '▸'} {hidden} earlier {hidden === 1 ? 'entry' : 'entries'}</Text> })
+    }
+    // Paths in the folder are shown from it.
+    const here = (text: string) => shortPath(text.replaceAll(`${folder}/`, ''))
+    const width = Math.max(10, columns - inner * 2 - 2)
+    for (const turn of turns) {
+      const at = `${group}\t${turn.key}`
+      if (turn.kind === 'tool') {
+        const isTurnOpen = isOpen(at, false)
+        rows.push({
+          key: at,
+          parent: group,
+          depth: inner,
+          canOpen: true,
+          // The file it read or edited, which `o` and `e` open, from its lines too.
+          ...(turn.file && { file: turn.file, line: 1 }),
+          node: (
+            <Text wrap="truncate-end">
+              <Text dimColor>{isTurnOpen ? '▾' : '▸'} {here(turn.text)}</Text>
+              {turn.isFailed && <Text color="red"> ✗</Text>}
+            </Text>
+          ),
+        })
+        if (!isTurnOpen) continue
+        turn.input?.forEach((line, n) => note(`${at}\tin${n}`, at, inner + 1, here(line)))
+        if (!turn.result) note(`${at}\tpending`, at, inner + 1, 'No result yet.')
+        turn.result?.forEach((line, n) => {
+          rows.push({ key: `${at}\tout${n}`, parent: at, depth: inner + 1, node: <Text color={turn.isFailed ? 'red' : undefined} dimColor={!turn.isFailed} wrap="truncate-end">{n === 0 ? '→ ' : '  '}{line || ' '}</Text> })
+        })
+        if (turn.more) note(`${at}\tmore`, at, inner + 1, `  … ${plural(turn.more, 'more line')}`)
+        continue
+      }
+      const lines = wrapText(turn.text, width)
+      const canOpen = lines.length > REPLY_LINES
+      const isTurnOpen = canOpen && isOpen(at, false)
+      const shown = isTurnOpen ? lines : lines.slice(0, REPLY_LINES)
+      shown.forEach((line, n) => {
+        rows.push({
+          key: n === 0 ? at : `${at}\t${n}`,
+          parent: n === 0 || !canOpen ? group : at,
+          depth: inner,
+          canOpen: n === 0 && canOpen,
+          node: (
+            <Text wrap="truncate-end">
+              <Text dimColor>{n === 0 && canOpen ? (isTurnOpen ? '▾ ' : '▸ ') : '  '}</Text>
+              <Text bold={turn.kind === 'prompt'}>{line}</Text>
+              {canOpen && !isTurnOpen && n === shown.length - 1 && <Text dimColor> …</Text>}
+            </Text>
+          ),
+        })
+      })
+    }
+  }
+
+  return rows
+}
 
 // The repo tab's lines: the worktree's folders first then its files, each open folder's insides under it,
 // and under an open file the file itself or, with `isDiff`, its diff against HEAD.
@@ -2886,28 +2920,30 @@ const agentState = (agent: Agent): AgentState => (agent.isWaiting ? 'waiting' : 
 const AGENT_STATES: AgentState[] = ['waiting', 'busy', 'idle']
 const AGENT_LOOKS: Record<AgentState, { mark: string; color?: string }> = { waiting: { mark: '◆', color: 'yellow' }, busy: { mark: '●', color: 'green' }, idle: { mark: '○' } }
 
-// The agents tab's lines: every agent running in any worktree, those waiting for the person first, then those at work,
-// then the idle ones, each with its worktree's branch, how long it has been on its turn or idle, and the start of
-// what it last said. Opened, its worktree's folder, its tmux pane, and all it last said or asks.
-// With a `query`, only the agents whose name, branch or words match it.
+// The agents tab's lines: every agent running on the machine, those waiting for the person first, then those at work,
+// then the idle ones, each with its worktree's branch (or, outside the repository, its folder), how long it has been
+// on its turn or idle, and the start of what it last said. The repository's come before the rest in each state.
+// Opened, its folder, its tmux pane, all it last said or asks, and a claude's conversation, open.
+// With a `query`, only the agents whose name, branch, folder or words match it.
 const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, columns: number, query: string) => {
   const rows: Row[] = []
-  const panes = repo.trees.flatMap(t => t.panes)
+  const panes = repo.panes
   const note = (key: string, parent: string, depth: number, text: string) =>
     rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
-  const all = repo.trees
-    .flatMap(tree => tree.agents.map(agent => ({ agent, tree, state: agentState(agent) })))
-    .filter(({ agent, tree }) => isMatch(query, [agent.name, label(tree), agent.says ?? '']))
-    .sort((a, b) => AGENT_STATES.indexOf(a.state) - AGENT_STATES.indexOf(b.state) || label(a.tree).localeCompare(label(b.tree)) || a.agent.pid - b.agent.pid)
+  const all = [...repo.trees, ...repo.away]
+    .flatMap(tree => tree.agents.map(agent => ({ agent, tree, state: agentState(agent), isAway: !('branch' in tree) })))
+    .filter(({ agent, tree }) => isMatch(query, [agent.name, placeName(tree), tree.path, agent.says ?? '']))
+    .sort((a, b) => AGENT_STATES.indexOf(a.state) - AGENT_STATES.indexOf(b.state) || Number(a.isAway) - Number(b.isAway) || placeName(a.tree).localeCompare(placeName(b.tree)) || a.agent.pid - b.agent.pid)
   // Names and branches padded to line up, a very long branch cut.
   const nameWidth = Math.max(0, ...all.map(a => a.agent.name.length))
-  const branchWidth = Math.min(30, Math.max(0, ...all.map(a => label(a.tree).length)))
+  const branchWidth = Math.min(30, Math.max(0, ...all.map(a => placeName(a.tree).length)))
 
-  for (const { agent, tree, state } of all) {
+  for (const { agent, tree, state, isAway } of all) {
     const key = `agent\t${tree.path}\t${agent.pid}`
     const open = isOpen(key, false)
     const look = AGENT_LOOKS[state]
-    const name = label(tree)
+    const name = placeName(tree)
+    const isBase = !isAway && (tree as Tree).isBase
     const branch = name.length > branchWidth ? `${name.slice(0, branchWidth - 1)}…` : name
     const since = state === 'busy' ? agent.turnAt : agent.idleAt
     rows.push({
@@ -2919,7 +2955,7 @@ const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) =>
           <Text dimColor>{open ? '▾' : '▸'} </Text>
           <Text color={look.color} dimColor={!look.color}>{look.mark} {agent.name.padEnd(nameWidth)}</Text>
           {'  '}
-          <Text bold color={tree.isBase ? undefined : 'blue'}>{branch.padEnd(branchWidth)}</Text>
+          <Text bold={!isAway} color={isBase ? undefined : isAway ? 'magenta' : 'blue'}>{branch.padEnd(branchWidth)}</Text>
           <Text dimColor={state === 'idle'}>  {(since ? duration(Date.now() - since) : '').padStart(7)}</Text>
           {agent.says && <Text dimColor>  {agent.says}</Text>}
         </Text>
@@ -2927,14 +2963,16 @@ const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) =>
     })
     if (!open) continue
 
-    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${tree.isBase ? ' · base' : ''} · pid ${agent.pid}${agent.spend ? ` · ${spendText(agent.spend)}` : ''}`)
+    note(`${key}\tpath`, key, 1, `${shortPath(tree.path)}${isBase ? ' · base' : isAway ? ' · outside this repository' : ''} · pid ${agent.pid}${agent.spend ? ` · ${spendText(agent.spend)}` : ''}`)
     const pane = paneOf(panes, agent.pid)
     const where = pane
       ? `tmux ${pane.id} · window ${pane.window} (${pane.windowName}) · ${pane.command}`
       : process.env.TMUX ? 'in no tmux pane kelp can see' : 'kelp is not in tmux, so it sees no panes'
     note(`${key}\tpane`, key, 1, where)
-    const says = agent.says ? wrapText(agent.isAsking ? `asks: ${agent.says}` : agent.says, columns - 2) : []
+    // A claude's conversation, below, has what it said; only what it asks shows here too.
+    const says = agent.says && (!agent.turns || agent.isAsking) ? wrapText(agent.isAsking ? `asks: ${agent.says}` : agent.says, columns - 2) : []
     says.forEach((line, n) => rows.push({ key: `${key}\tsays\t${n}`, parent: key, depth: 1, node: <Text wrap="truncate-end">{line}</Text> }))
+    rows.push(...chatRows([agent], key, 1, tree.path, columns, isOpen, true))
   }
   if (all.length === 0) {
     note('none', '', 0, query ? `No agent matches "${query}".` : 'No agents running: N starts claude on a new task, a on a worktree starts one there.')
@@ -3218,14 +3256,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       try {
         const [found, listed] = await Promise.all([loadRepo(root), tabRef.current === 'repo' ? loadFiles(root) : undefined])
         // An agent that starts waiting rings the bell, once, and says so; not one already waiting when kelp starts.
-        const agents = (found?.trees ?? []).flatMap(t => t.agents.map(agent => ({ agent, tree: t })))
+        const agents = [...(found?.trees ?? []), ...(found?.away ?? [])].flatMap(t => t.agents.map(agent => ({ agent, tree: t })))
         const started = agents.filter(({ agent }) => agent.isWaiting && wasWaiting?.get(agent.pid) === false)
         wasWaiting = new Map(agents.map(({ agent }) => [agent.pid, agent.isWaiting === true]))
         if (started.length > 0) {
           process.stdout.write('\x07')
           const { agent, tree } = started[0]
           const others = started.length > 1 ? `, and ${started.length - 1} more` : ''
-          setNotice(`◆ ${agent.name} in ${label(tree)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''}${others}`)
+          setNotice(`◆ ${agent.name} in ${placeName(tree)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''}${others}`)
           // Its conversation opens, its last entry too, so what it asks shows once its worktree is opened.
           setToggled(cur => {
             const next = new Set(cur)
@@ -3234,6 +3272,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
               const last = agent.turns!.at(-1)
               next.add(group)
               if (last) next.add(`${group}\t${last.key}`)
+              // In the agents tab its conversation is open already, so only its last entry opens.
+              if (last) next.add(`agent\t${tree.path}\t${agent.pid}\tchat\t${agent.session}\t${last.key}`)
             }
 
             return next
@@ -3444,14 +3484,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // which takes it once its turn is done. Says why when there is no pane to send to.
   // On a line of a diff or file it asks for a review note instead, sent as "<file>:<line>: <note>".
   const reply = async () => {
-    const tree = treeUnder()
+    const tree = placeUnder()
     if (!repo || !tree) return setNotice('Move to a worktree to answer its agent.')
-    const name = label(tree)
+    const name = placeName(tree)
     const agent = agentUnder() ?? tree.agents.find(a => a.isWaiting) ?? tree.agents.find(a => a.isBusy === false) ?? tree.agents[0]
     if (!agent) return setNotice(`No agent runs in ${name}, so there is nothing to send to: a starts claude.`)
     const who = `${agent.name} in ${name}`
     if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to ${who} through.`)
-    const pane = paneOf(repo.trees.flatMap(t => t.panes), agent.pid)
+    const pane = paneOf(repo.panes, agent.pid)
     if (!pane) return setNotice(`${who} runs in no tmux pane kelp can see, so there is nowhere to send to.`)
     const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
     // A line under a file, not the file's own line, which opens and closes.
@@ -3481,7 +3521,15 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const [kind, path, pid] = row?.key.split('\t') ?? []
     if (tab !== 'agents' || kind !== 'agent') return undefined
 
-    return repo?.trees.find(t => t.path === path)?.agents.find(a => a.pid === Number(pid))
+    return repo && [...repo.trees, ...repo.away].find(t => t.path === path)?.agents.find(a => a.pid === Number(pid))
+  }
+
+  // The worktree under the cursor, as treeUnder, or in the agents tab the worktree or folder of the agent there.
+  const placeUnder = (): Place | undefined => {
+    if (tab !== 'agents') return treeUnder()
+    const path = row?.key.split('\t')[1]
+
+    return repo ? [...repo.trees, ...repo.away].find(t => t.path === path) : undefined
   }
 
   // The worktree under the cursor, or in the repo tab the one it explores.
@@ -4096,11 +4144,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'A') nextWaiting()
     else if (input === '>') reply()
     else if (input === 't' || input === 'a') {
-      const tree = treeUnder()
+      const tree = placeUnder()
       // In the agents tab, t goes to the agent's own pane.
       const agent = agentUnder()
-      const pane = agent && repo ? paneOf(repo.trees.flatMap(t => t.panes), agent.pid) : undefined
-      if (tree) (input === 't' ? jumpTo(tree, pane ?? tree.panes[0]) : startClaude(tree.path, label(tree))).then(text => {
+      const pane = agent && repo ? paneOf(repo.panes, agent.pid) : undefined
+      if (tree) (input === 't' ? jumpTo(tree, pane ?? tree.panes[0]) : startClaude(tree.path, placeName(tree))).then(text => {
         setNotice(text)
         refresh.current()
       })
@@ -4184,7 +4232,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
   const conflicting = repo ? repo.trees.filter(t => t.conflicts.length > 0).length : 0
   const changed = files ? Object.keys(files.status).length : 0
-  const agents = repo ? repo.trees.flatMap(t => t.agents) : []
+  const agents = repo ? [...repo.trees, ...repo.away].flatMap(t => t.agents) : []
   const waitingCount = agents.filter(a => a.isWaiting).length
   const header = (
     <Text wrap="truncate-end">
