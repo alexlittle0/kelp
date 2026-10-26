@@ -79,12 +79,13 @@ const USAGE_CHUNK = 4 * 1024 * 1024
 // How much of the end of a claude transcript its conversation is read from, the entries of it kept,
 // and the characters of a prompt or reply kept.
 const CONVERSATION_TAIL = 1024 * 1024
-const MAX_TURNS = 50
+const MAX_TURNS = 200
 const MAX_TURN_TEXT = 4000
+// An open conversation's window on its rows, as a share of the screen's, and at least how many it shows.
+const CHAT_SHARE = 1 / 3
+const CHAT_MIN_ROWS = 8
 // Lines of a reply or prompt shown before it is opened for the rest, and of a tool call's input and result shown once opened.
 const REPLY_LINES = 3
-// Entries an opened conversation shows, the earlier ones behind a row of their own.
-const RECENT_TURNS = 10
 const TOOL_INPUT_LINES = 6
 const TOOL_RESULT_LINES = 8
 // Tools that run a while with no process of their own, so a call to one waiting is no sign of asking.
@@ -379,6 +380,13 @@ type Job = { text: string; isFailed?: boolean }
 // One line of the view; `parent` is the line it sits under, `canOpen` whether it opens and closes,
 // `isOpenByDefault` whether it starts open, `isGap` a blank line between worktrees that the cursor passes over,
 // `file` and `line` where `o` opens it in nvim.
+// An open conversation's window: its top row, Infinity while it follows the newest; and as it was last drawn, its rows'
+// keys (gaps marked, as the cursor doesn't stop on them) and how many it shows at once.
+type ChatScroll = { top: number; keys: { key: string; isGap?: boolean }[]; height: number }
+
+// What windowing conversations needs: each one's scroll by its key, the row under the cursor, and the window's height.
+type ChatView = { scrolls: Map<string, ChatScroll>; cursor: string; height: number }
+
 type Row = {
   key: string
   parent?: string
@@ -386,6 +394,9 @@ type Row = {
   canOpen?: boolean
   isOpenByDefault?: boolean
   isGap?: boolean
+  // In an open conversation's window: its key, and the rows with words before and after this one, which `j` and `k`
+  // go to when they are scrolled out of the window.
+  chat?: { group: string; prev?: string; next?: string }
   file?: string
   line?: number
   node: JSX.Element
@@ -2486,6 +2497,7 @@ const buildRows = (
   prs: Map<string, Pr>,
   query: string,
   jobs: Map<string, Job>,
+  chat: ChatView,
 ) => {
   const rows: Row[] = []
   const wanted: Wanted[] = []
@@ -2789,7 +2801,7 @@ const buildRows = (
       }
     }
 
-    rows.push(...chatRows(tree.agents, key, 1, tree.path, columns, isOpen, false))
+    rows.push(...chatRows(tree.agents, key, 1, tree.path, columns, isOpen, false, chat))
 
     if (uncommitted.length > 0) {
       const group = `${key}\tuncommitted`
@@ -2832,7 +2844,7 @@ const statusOf = (code: string) =>
 // `isOpenByDefault`: its latest entries, newest at the bottom. A prompt (a cyan "›", bold) or reply (an orange "●",
 // its markdown shown) has a blank line before it and shows its first lines until opened; a tool call is one dim line,
 // opening to its input and the start of its result. Paths in `folder` show from it.
-const chatRows = (agents: Agent[], parent: string, depth: number, folder: string, columns: number, isOpen: (key: string, byDefault: boolean) => boolean, isOpenByDefault: boolean) => {
+const chatRows = (agents: Agent[], parent: string, depth: number, folder: string, columns: number, isOpen: (key: string, byDefault: boolean) => boolean, isOpenByDefault: boolean, view: ChatView) => {
   const rows: Row[] = []
   const note = (key: string, parent: string, depth: number, text: string) =>
     rows.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
@@ -2857,22 +2869,19 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
       ),
     })
     if (!isChatOpen) continue
-    // The latest entries, the earlier ones folded away so the end shows.
-    const earlier = `${group}\tearlier`
-    const hidden = Math.max(0, agent.turns!.length - RECENT_TURNS)
-    const turns = hidden > 0 && !isOpen(earlier, false) ? agent.turns!.slice(hidden) : agent.turns!
-    if (agent.turns!.length === 0) note(`${group}\tnone`, group, inner, 'Nothing said yet.')
-    if (hidden > 0) {
-      rows.push({ key: earlier, parent: group, depth: inner, canOpen: true, node: <Text dimColor wrap="truncate-end">{isOpen(earlier, false) ? '▾' : '▸'} {hidden} earlier {hidden === 1 ? 'entry' : 'entries'}</Text> })
-    }
+    // All its rows go in `body`, and only the window's share of them in `rows`.
+    const body: Row[] = []
+    const say = (key: string, parent: string, depth: number, text: string) =>
+      body.push({ key, parent, depth, node: <Text dimColor wrap="truncate-end">{text}</Text> })
+    if (agent.turns!.length === 0) say(`${group}\tnone`, group, inner, 'Nothing said yet.')
     // Paths in the folder are shown from it.
     const here = (text: string) => shortPath(text.replaceAll(`${folder}/`, ''))
     const width = Math.max(10, columns - inner * 2 - 2)
-    for (const turn of turns) {
+    for (const turn of agent.turns!) {
       const at = `${group}\t${turn.key}`
       if (turn.kind === 'tool') {
         const isTurnOpen = isOpen(at, false)
-        rows.push({
+        body.push({
           key: at,
           parent: group,
           depth: inner,
@@ -2887,12 +2896,12 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
           ),
         })
         if (!isTurnOpen) continue
-        turn.input?.forEach((line, n) => note(`${at}\tin${n}`, at, inner + 1, here(line)))
-        if (!turn.result) note(`${at}\tpending`, at, inner + 1, 'No result yet.')
+        turn.input?.forEach((line, n) => say(`${at}\tin${n}`, at, inner + 1, here(line)))
+        if (!turn.result) say(`${at}\tpending`, at, inner + 1, 'No result yet.')
         turn.result?.forEach((line, n) => {
-          rows.push({ key: `${at}\tout${n}`, parent: at, depth: inner + 1, node: <Text color={turn.isFailed ? 'red' : undefined} dimColor={!turn.isFailed} wrap="truncate-end">{n === 0 ? '→ ' : '  '}{line || ' '}</Text> })
+          body.push({ key: `${at}\tout${n}`, parent: at, depth: inner + 1, node: <Text color={turn.isFailed ? 'red' : undefined} dimColor={!turn.isFailed} wrap="truncate-end">{n === 0 ? '→ ' : '  '}{line || ' '}</Text> })
         })
-        if (turn.more) note(`${at}\tmore`, at, inner + 1, `  … ${plural(turn.more, 'more line')}`)
+        if (turn.more) say(`${at}\tmore`, at, inner + 1, `  … ${plural(turn.more, 'more line')}`)
         continue
       }
       const isPrompt = turn.kind === 'prompt'
@@ -2905,9 +2914,9 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
       const isTurnOpen = canOpen && isOpen(at, false)
       const shown = isTurnOpen ? lines : lines.slice(0, end)
       // A blank line before each prompt and reply sets them apart, as claude's own view does.
-      rows.push({ key: `${at}\tgap`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
+      body.push({ key: `${at}\tgap`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
       shown.forEach((tokens, n) => {
-        rows.push({
+        body.push({
           key: n === 0 ? at : `${at}\t${n}`,
           parent: n === 0 || !canOpen ? group : at,
           depth: inner,
@@ -2922,6 +2931,22 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
         })
       })
     }
+    // The window: kept on the cursor's row when that is in it, else where it was scrolled to, else on the newest rows.
+    const height = Math.min(body.length, view.height)
+    const most = body.length - height
+    let top = Math.min(view.scrolls.get(group)?.top ?? Infinity, most)
+    const at = body.findIndex(r => r.key === view.cursor)
+    if (at !== -1) top = Math.min(Math.max(top, at - height + 1), at)
+    top = Math.max(0, top)
+    view.scrolls.set(group, { top: top >= most ? Infinity : top, keys: body.map(r => ({ key: r.key, isGap: r.isGap })), height })
+    if (top > 0) rows.push({ key: `${group}\tabove`, parent: group, depth: inner, isGap: true, chat: { group }, node: <Text dimColor>↑ {top} more</Text> })
+    for (let n = top; n < top + height; n++) {
+      const prev = body.slice(0, n).findLast(r => !r.isGap)?.key
+      const next = body.slice(n + 1).find(r => !r.isGap)?.key
+      rows.push({ ...body[n], chat: { group, prev, next } })
+    }
+    const below = most - top
+    if (below > 0) rows.push({ key: `${group}\tbelow`, parent: group, depth: inner, isGap: true, chat: { group }, node: <Text dimColor>↓ {below} more</Text> })
     // A blank line after an open conversation keeps what follows from crowding its last entry.
     rows.push({ key: `${group}\tend`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
   }
@@ -3048,7 +3073,7 @@ const AGENT_LOOKS: Record<AgentState, { mark: string; color?: string }> = { wait
 // on its turn or idle, and the start of what it last said. The repository's come before the rest in each state.
 // Opened, its folder, its tmux pane, all it last said or asks, and a claude's conversation, open.
 // With a `query`, only the agents whose name, branch, folder or words match it.
-const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, columns: number, query: string) => {
+const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) => boolean, columns: number, query: string, chat: ChatView) => {
   const rows: Row[] = []
   const panes = repo.panes
   const note = (key: string, parent: string, depth: number, text: string) =>
@@ -3095,7 +3120,7 @@ const buildAgentRows = (repo: Repo, isOpen: (key: string, byDefault: boolean) =>
     // A claude's conversation, below, has what it said; only what it asks shows here too.
     const says = agent.says && (!agent.turns || agent.isAsking) ? wrapText(agent.isAsking ? `asks: ${agent.says}` : agent.says, columns - 2) : []
     says.forEach((line, n) => rows.push({ key: `${key}\tsays\t${n}`, parent: key, depth: 1, node: <Text wrap="truncate-end">{line}</Text> }))
-    rows.push(...chatRows([agent], key, 1, tree.path, columns, isOpen, true))
+    rows.push(...chatRows([agent], key, 1, tree.path, columns, isOpen, true, chat))
   }
   if (all.length === 0) {
     note('none', '', 0, query ? `No agent matches "${query}".` : 'No agents running: N starts claude on a new task, a on a worktree starts one there.')
@@ -3333,6 +3358,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // Bumped to draw again after the wheel moves the view and the cursor's row stays the same.
   const [, redraw] = useState(0)
   const tops = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0, agents: 0 })
+  // Each open conversation's window, by the conversation's key.
+  const chatScrolls = useRef(new Map<string, ChatScroll>())
   const lastIndexes = useRef<Record<Tab, number>>({ worktrees: 0, repo: 0, agents: 0 })
   const tabRef = useRef(tab)
   tabRef.current = tab
@@ -3485,12 +3512,13 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // Gutter of two, and one column spare so a row never touches the edge and wraps.
   const columns = Math.max(20, size.columns - 3)
   const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
+  const chat: ChatView = { scrolls: chatScrolls.current, cursor: cursors[tab], height: Math.max(CHAT_MIN_ROWS, Math.floor((size.rows - 3) * CHAT_SHARE)) }
   const { rows, wanted } =
     tab === 'repo'
       ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
       : tab === 'agents'
-        ? (repo ? buildAgentRows(repo, isOpen, columns, filters.agents) : empty)
-        : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs) : empty
+        ? (repo ? buildAgentRows(repo, isOpen, columns, filters.agents, chat) : empty)
+        : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs, chat) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
 
@@ -3564,12 +3592,30 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     redraw(n => n + 1)
   }
 
+  // Scrolls the open conversation `group` by `lines`, bringing the cursor along when it is in it and would fall out.
+  const scrollChat = (group: string, lines: number) => {
+    const scroll = chatScrolls.current.get(group)
+    if (!scroll) return
+    const most = scroll.keys.length - scroll.height
+    const to = Math.max(0, Math.min(most, Math.min(scroll.top, most) + lines))
+    scroll.top = to >= most ? Infinity : to
+    const at = scroll.keys.findIndex(k => k.key === cursor)
+    if (at !== -1 && (at < to || at >= to + scroll.height)) {
+      const shown = scroll.keys.slice(to, to + scroll.height)
+      const pick = at < to ? shown.find(k => !k.isGap) : shown.findLast(k => !k.isGap)
+      if (pick) setCursor(pick.key)
+    }
+    redraw(n => n + 1)
+  }
+
   // A mouse report: SGR's "[<button;column;line" then M when pressed, m when let go.
   // A left click on a tab's name in the header switches to it; on a row it puts the cursor there
-  // and opens or closes it. The wheel scrolls.
+  // and opens or closes it. The wheel scrolls, over an open conversation that conversation alone.
   const onMouse = (button: number, column: number, line: number) => {
     // Shift, alt and ctrl only add to the button's number.
     const base = button & ~(4 | 8 | 16)
+    const hovered = line >= 2 ? rows[top + line - 2] : undefined
+    if ((base === 64 || base === 65) && !isHelp && hovered?.chat) return scrollChat(hovered.chat.group, base === 64 ? -WHEEL_LINES : WHEEL_LINES)
     if (base === 64) return isHelp ? scrollHelp(-WHEEL_LINES) : scroll(-WHEEL_LINES)
     if (base === 65) return isHelp ? scrollHelp(WHEEL_LINES) : scroll(WHEEL_LINES)
     if (isHelp) return
@@ -4334,6 +4380,9 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'N' && tab !== 'repo' && repo) newTask()
     else if ((input === 'x' || input === 'X') && tab === 'worktrees') removeTree(input === 'X')
     else if (input === 'C' && tab === 'worktrees') cleanUp()
+    // In an open conversation, past the edge of its window, onto the row scrolled out of it, which scrolls it.
+    else if ((key.upArrow || input === 'k') && row?.chat?.prev && !rows.some(r => r.key === row.chat!.prev)) setCursor(row.chat.prev)
+    else if ((key.downArrow || input === 'j') && row?.chat?.next && !rows.some(r => r.key === row.chat!.next)) setCursor(row.chat.next)
     else if (key.upArrow || input === 'k') moveTo(index - 1, -1)
     else if (key.downArrow || input === 'j') moveTo(index + 1, 1)
     else if (key.pageUp || (key.ctrl && input === 'u')) moveTo(index - height, -1)
