@@ -1251,7 +1251,7 @@ const findAgents = () => {
       const transcript = transcriptOf(pid, cwd)
       const chat = transcript ? { session: transcript.name, turns: readConversation(transcript.file) } : {}
 
-      return { name, pid, cwd, ...claudeState(pid, transcript), spend: claudeSpend(cwd), ...chat }
+      return { name, pid, cwd, ...claudeState(pid, transcript), spend: transcript ? claudeSpend(transcript.file) : undefined, ...chat }
     })
 }
 
@@ -1510,13 +1510,12 @@ const subagentTranscripts = (file: string) => {
   }
 }
 
-// What the session of a claude in `cwd` has used, from its newest transcript, its subagents' counted in;
+// What the session of a claude has used, from its transcript `file`, its subagents' counted in;
 // undefined when it has none. Its context is its own.
-const claudeSpend = (cwd: string): Spend | undefined => {
-  const transcript = newestTranscript(cwd)
-  const usage = transcript && readUsage(transcript.file)
+const claudeSpend = (file: string): Spend | undefined => {
+  const usage = readUsage(file)
   if (!usage) return undefined
-  const all = [usage, ...subagentTranscripts(transcript.file).flatMap(f => readUsage(f) ?? [])].flatMap(u => [...u.models])
+  const all = [usage, ...subagentTranscripts(file).flatMap(f => readUsage(f) ?? [])].flatMap(u => [...u.models])
   const used = all.map(([model, t]) => ({ model, t, tokens: t.input + t.output + t.write5m + t.write1h + t.read })).filter(m => m.tokens > 0)
   const costs = used.map(m => dollarsOf(m.model, m.t))
 
