@@ -4475,7 +4475,8 @@ let switchTo = ''
 // The alternate screen, so quitting gives the terminal back as it was,
 // and mouse reports in SGR form: clicks and the wheel, not plain movement.
 process.stdout.write('\x1b[?1049h\x1b[H\x1b[?1000h\x1b[?1006h')
-const app = render(<App root={root} saved={loadSaved(STATE_FILE)} />)
+// Only the lines that changed are written again: erasing and rewriting the whole screen on every keypress flickers.
+const app = render(<App root={root} saved={loadSaved(STATE_FILE)} />, { incrementalRendering: true })
 await app.waitUntilExit()
 if (latest) save(STATE_FILE, latest)
 // Commands still running, such as dev servers, end with kelp.

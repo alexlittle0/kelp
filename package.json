@@ -4,7 +4,9 @@
   "description": "Every git worktree of a repository in one live view: its commits, its uncommitted changes and their diffs",
   "type": "module",
   "private": true,
-  "bin": { "kelp": "src/kelp.tsx" },
+  "bin": {
+    "kelp": "src/kelp.tsx"
+  },
   "scripts": {
     "start": "bun src/kelp.tsx",
     "build": "bun build src/kelp.tsx --compile --outfile dist/kelp",
@@ -12,7 +14,7 @@
   },
   "dependencies": {
     "highlight.js": "^11.12.0",
-    "ink": "^6.0.0",
+    "ink": "7.1.1",
     "react": "^19.0.0"
   },
   "devDependencies": {
