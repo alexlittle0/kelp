@@ -57,6 +57,8 @@ const FETCH_ENV: Record<string, string> = {
 }
 // The coding agents kelp looks for among running processes.
 const AGENTS = ['claude', 'codex', 'aider', 'gemini', 'opencode', 'cursor-agent']
+// The colour of claude's mark on its replies in a conversation, its own orange.
+const CLAUDE_COLOR = '#d97757'
 // A claude counts as busy while its transcript was written this recently.
 const BUSY_MS = 30_000
 // A claude whose tool call has waited this long with nothing running for it is asking leave to run it.
@@ -1043,9 +1045,10 @@ const readEnding = (file: string, at: number): Ending | null => {
   const blocks = (e: Entry) => (Array.isArray(e.message?.content) ? e.message.content : [{ type: 'text', text: e.message?.content }]) as { type: string; text?: string; name?: string; input?: Record<string, unknown> }[]
   const conversation = entries.filter(e => e.type === 'assistant' || (e.type === 'user' && !e.isMeta))
   const last = conversation.at(-1)
-  // What it said last, in one line.
+  // Its last reply with words in.
   const said = conversation.findLast(e => e.type === 'assistant' && blocks(e).some(b => b.type === 'text' && b.text?.trim()))
-  const says = (said ? blocks(said).filter(b => b.type === 'text').map(b => b.text).join(' ') : '').replace(/\s+/g, ' ').trim()
+  // What it said last, in one line, its markdown's marks left out.
+  const says = (said ? blocks(said).filter(b => b.type === 'text').map(b => b.text).join(' ') : '').replace(/\*\*|`/g, '').replace(/(^|\s)#{1,6}(?=\s)/g, '$1').replace(/\s+/g, ' ').trim()
   // The person's last prompt, which began the turn: a user entry that is not a tool's result.
   const prompted = conversation.findLast(e => e.type === 'user' && !blocks(e).some(b => b.type === 'tool_result'))
   const turnAt = Date.parse(prompted?.timestamp ?? '') || 0
@@ -1998,6 +2001,101 @@ const wrapText = (text: string, width: number) =>
     return [...lines, line].filter(l => l.trim())
   })
 
+// A claude reply's markdown as lines of styled tokens at most `width` columns wide. Headings and **bold** show bold,
+// `code` green as kelp's markdown highlighting has it, a link as its words; list items and quotes wrap under their
+// own text. A fenced code block is highlighted for its language and, like a table's lines, left for the row to cut.
+// One blank line is kept between paragraphs.
+const markdownLines = (text: string, width: number) => {
+  const out: Token[][] = []
+  const blank = () => {
+    if (out.length > 0 && out[out.length - 1].length > 0) out.push([])
+  }
+  const inline = (line: string, style: Style = {}): Token[] =>
+    line
+      .replace(/[\x00-\x1f\x7f]/g, '·')
+      .split(/(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/)
+      .filter(Boolean)
+      .map(part => {
+        if (/^\*\*.+\*\*$/.test(part)) return { ...style, text: part.slice(2, -2), isBold: true }
+        if (/^`.+`$/.test(part)) return { ...style, text: part.slice(1, -1), color: 'green' }
+        const link = part.match(/^\[([^\]]+)\]\([^)\s]+\)$/)
+        if (link) return { ...style, text: link[1], color: 'cyan' }
+        return { ...style, text: part }
+      })
+  // Words keep their look, lines break at spaces; the first line starts with `lead`, the rest with `hang`.
+  const wrap = (tokens: Token[], lead: Token[], hang: Token) => {
+    const room = Math.max(10, width - hang.text.length)
+    let line: Token[] = [...lead]
+    let length = 0
+    for (const token of tokens) {
+      for (const piece of token.text.split(/(?<= )/)) {
+        let rest = piece
+        while (rest) {
+          if (length > 0 && length + rest.trimEnd().length > room) {
+            // The space after its last word would run it a column over.
+            line[line.length - 1] = { ...line[line.length - 1], text: line[line.length - 1].text.trimEnd() }
+            out.push(line)
+            line = [hang]
+            length = 0
+          }
+          // A word longer than a whole line is cut across lines.
+          const take = length === 0 && rest.length > room ? rest.slice(0, room) : rest
+          line.push({ ...token, text: take })
+          length += take.length
+          rest = rest.slice(take.length)
+        }
+      }
+    }
+    out.push(line)
+  }
+  const lines = text.replace(/\r/g, '').replace(/\t/g, '  ').split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const fence = line.match(/^\s*(```+|~~~+)\s*([\w+#.-]*)/)
+    if (fence) {
+      const code: string[] = []
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) code.push(lines[i].replace(/[\x00-\x1f\x7f]/g, '·'))
+      const tokens = highlight(code, fence[2] && hljs.getLanguage(fence[2]) ? fence[2] : undefined)
+      code.forEach((text, k) => out.push([{ text: '  ' }, ...(tokens?.[k] ?? [{ text }])]))
+      continue
+    }
+    if (!line.trim()) {
+      blank()
+      continue
+    }
+    if (/^\s*\|/.test(line)) {
+      // A table's rule under its header is left out.
+      if (!/^\s*\|[\s:|-]+$/.test(line)) out.push(inline(line.trim()))
+      continue
+    }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      out.push([{ text: '─'.repeat(Math.min(width, 40)), isDim: true }])
+      continue
+    }
+    const heading = line.match(/^#{1,6}\s+(.*)/)
+    if (heading) {
+      blank()
+      wrap(inline(heading[1], { isBold: true }), [], { text: '' })
+      continue
+    }
+    const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)/)
+    if (item) {
+      const mark = /\d/.test(item[2]) ? item[2] : '•'
+      wrap(inline(item[3]), [{ text: item[1] }, { text: `${mark} `, isDim: true }], { text: ' '.repeat(item[1].length + mark.length + 1) })
+      continue
+    }
+    const quote = line.match(/^\s*>\s?(.*)/)
+    if (quote) {
+      wrap(inline(quote[1], { isDim: true }), [{ text: '│ ', isDim: true }], { text: '│ ', isDim: true })
+      continue
+    }
+    wrap(inline(line.trim()), [], { text: '' })
+  }
+  while (out.length > 0 && out[out.length - 1].length === 0) out.pop()
+
+  return out
+}
+
 const ago = (at: number) => {
   const minutes = Math.floor((Date.now() - at) / 60_000)
   if (minutes < 1) return 'just now'
@@ -2715,8 +2813,9 @@ const statusOf = (code: string) =>
   : { text: 'modified', color: 'yellow' }
 
 // The rows of each claude's conversation among `agents`, under the row `parent` at `depth`, closed unless
-// `isOpenByDefault`: its latest entries, newest at the bottom. A prompt (bold) or reply shows its first lines until
-// opened; a tool call is one dim line, opening to its input and the start of its result. Paths in `folder` show from it.
+// `isOpenByDefault`: its latest entries, newest at the bottom. A prompt (a cyan "›", bold) or reply (an orange "●",
+// its markdown shown) has a blank line before it and shows its first lines until opened; a tool call is one dim line,
+// opening to its input and the start of its result. Paths in `folder` show from it.
 const chatRows = (agents: Agent[], parent: string, depth: number, folder: string, columns: number, isOpen: (key: string, byDefault: boolean) => boolean, isOpenByDefault: boolean) => {
   const rows: Row[] = []
   const note = (key: string, parent: string, depth: number, text: string) =>
@@ -2780,11 +2879,18 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
         if (turn.more) note(`${at}\tmore`, at, inner + 1, `  … ${plural(turn.more, 'more line')}`)
         continue
       }
-      const lines = wrapText(turn.text, width)
-      const canOpen = lines.length > REPLY_LINES
+      const isPrompt = turn.kind === 'prompt'
+      // The person's prompt as they typed it, bold; claude's reply as its markdown reads.
+      const lines = isPrompt ? wrapText(turn.text, width).map(text => [{ text, isBold: true }]) : markdownLines(turn.text, width)
+      // Closed, it shows up to its REPLY_LINES-th line with words in, as a blank line between paragraphs says nothing.
+      let end = 0
+      for (let words = 0; end < lines.length && words < REPLY_LINES; end++) if (lines[end].length > 0) words++
+      const canOpen = lines.length > end
       const isTurnOpen = canOpen && isOpen(at, false)
-      const shown = isTurnOpen ? lines : lines.slice(0, REPLY_LINES)
-      shown.forEach((line, n) => {
+      const shown = isTurnOpen ? lines : lines.slice(0, end)
+      // A blank line before each prompt and reply sets them apart, as claude's own view does.
+      rows.push({ key: `${at}\tgap`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
+      shown.forEach((tokens, n) => {
         rows.push({
           key: n === 0 ? at : `${at}\t${n}`,
           parent: n === 0 || !canOpen ? group : at,
@@ -2792,8 +2898,8 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
           canOpen: n === 0 && canOpen,
           node: (
             <Text wrap="truncate-end">
-              <Text dimColor>{n === 0 && canOpen ? (isTurnOpen ? '▾ ' : '▸ ') : '  '}</Text>
-              <Text bold={turn.kind === 'prompt'}>{line}</Text>
+              {n === 0 ? <Text bold color={isPrompt ? 'cyan' : CLAUDE_COLOR}>{isPrompt ? '› ' : '● '}</Text> : '  '}
+              {tokens.length > 0 ? codeNode('', tokens) : ' '}
               {canOpen && !isTurnOpen && n === shown.length - 1 && <Text dimColor> …</Text>}
             </Text>
           ),
