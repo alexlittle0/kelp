@@ -2022,25 +2022,41 @@ const markdownLines = (text: string, width: number) => {
         if (link) return { ...style, text: link[1], color: 'cyan' }
         return { ...style, text: part }
       })
-  // Words keep their look, lines break at spaces; the first line starts with `lead`, the rest with `hang`.
+  // Words keep their look, lines break at spaces only; the first line starts with `lead`, the rest with `hang`.
   const wrap = (tokens: Token[], lead: Token[], hang: Token) => {
     const room = Math.max(10, width - hang.text.length)
+    // Each word as its pieces, as `code` and the "." after it are two pieces of one word.
+    const words: Token[][] = [[]]
+    for (const token of tokens) {
+      for (const part of token.text.split(/( +)/)) {
+        if (part.startsWith(' ')) words.push([])
+        else if (part) words[words.length - 1].push({ ...token, text: part })
+      }
+    }
     let line: Token[] = [...lead]
     let length = 0
-    for (const token of tokens) {
-      for (const piece of token.text.split(/(?<= )/)) {
-        let rest = piece
+    for (const word of words.filter(w => w.length > 0)) {
+      const size = word.reduce((n, t) => n + t.text.length, 0)
+      if (length > 0 && length + 1 + size > room) {
+        out.push(line)
+        line = [hang]
+        length = 0
+      }
+      if (length > 0) {
+        line.push({ text: ' ' })
+        length += 1
+      }
+      // A word longer than a whole line is cut across lines.
+      for (const piece of word) {
+        let rest = piece.text
         while (rest) {
-          if (length > 0 && length + rest.trimEnd().length > room) {
-            // The space after its last word would run it a column over.
-            line[line.length - 1] = { ...line[line.length - 1], text: line[line.length - 1].text.trimEnd() }
+          if (length >= room) {
             out.push(line)
             line = [hang]
             length = 0
           }
-          // A word longer than a whole line is cut across lines.
-          const take = length === 0 && rest.length > room ? rest.slice(0, room) : rest
-          line.push({ ...token, text: take })
+          const take = rest.slice(0, room - length)
+          line.push({ ...piece, text: take })
           length += take.length
           rest = rest.slice(take.length)
         }
