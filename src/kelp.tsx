@@ -2605,7 +2605,7 @@ const buildRows = (
     const stashes = tree.stashes.map(s => ({ ...s, files: s.files.filter(f => shows(f.path)) })).filter(s => isWhole || s.files.length > 0)
     if (!isWhole && conflicts.length + uncommitted.length + commits.length + stashes.length === 0) continue
     // Worktrees start closed, one line each; a blank line sets one apart only after one left open.
-    if (rows.length > 0 && rows[rows.length - 1].depth > 0) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
+    if (rows.length > 0 && rows[rows.length - 1].depth > 0 && !rows[rows.length - 1].isGap) rows.push({ key: `${key}\tgap`, depth: 0, isGap: true, node: <Text> </Text> })
     const open = isOpen(key, false)
     // The worktree's line says only what wants a look: trouble in red, then work under way, then how far it has come.
     // The rest waits in its details line, shown when it is open.
@@ -2922,6 +2922,8 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
         })
       })
     }
+    // A blank line after an open conversation keeps what follows from crowding its last entry.
+    rows.push({ key: `${group}\tend`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
   }
 
   return rows
