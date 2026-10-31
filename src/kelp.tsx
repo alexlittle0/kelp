@@ -3,7 +3,7 @@ import { closeSync, cpSync, existsSync, fstatSync, mkdirSync, openSync, readdirS
 import { homedir } from 'node:os'
 import { basename, dirname, resolve } from 'node:path'
 import hljs from 'highlight.js'
-import { Box, Text, render, useApp, useInput, useStdout } from 'ink'
+import { Box, Text, render, useApp, useInput, usePaste, useStdout } from 'ink'
 import { useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
 
@@ -84,6 +84,11 @@ const MAX_TURN_TEXT = 4000
 // An open conversation's window on its rows, as a share of the screen's, and at least how many it shows.
 const CHAT_SHARE = 1 / 3
 const CHAT_MIN_ROWS = 8
+// An open conversation's window on a screen with room for `room` rows: its share of them, at least CHAT_MIN_ROWS,
+// but never more than leaves its heading and its "↑ more" and "↓ more" lines in view too, on a short screen.
+const chatHeight = (room: number) => Math.max(1, Math.min(room - 3, Math.max(CHAT_MIN_ROWS, Math.floor(room * CHAT_SHARE))))
+// Lines of a reply being written shown at once in its box under the conversation; more scroll within it.
+const DRAFT_LINES = 8
 // Lines of a reply or prompt shown before it is opened for the rest, and of a tool call's input and result shown once opened.
 const REPLY_LINES = 3
 const TOOL_INPUT_LINES = 6
@@ -123,6 +128,7 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
       ['⏎ space click', 'open or close'],
       ['→ l', 'open'],
       ['← h', 'close, or step out'],
+      ['H', 'close every row in the tab; again, open them as they were'],
     ],
   },
   {
@@ -161,9 +167,10 @@ const KEYS: { area: string; keys: [string, string][] }[] = [
     keys: [
       ['t', "jump to the worktree: its tmux pane, else a new window there; in the agents tab, the agent's own pane"],
       ['a', 'start claude in the worktree, in a new window'],
+      ['v', 'agents tab: every agent on the machine, or only those in this repository'],
       ['N', 'new task: a new worktree for a branch, and claude started in it on a prompt; name*3 for 3 attempts'],
       ['A', 'next worktree with an agent waiting for you; again soon, to its tmux pane'],
-      ['>', "reply: type a message into the worktree's agent (in the agents tab, the one under the cursor), in its tmux pane; on a diff line, a note on it; y/n when it asks leave"],
+      ['>', "reply to the worktree's agent (in the agents tab or a conversation, the one under the cursor), in its tmux pane; a claude in a box under its conversation; on a diff line, a note on it; y/n when it asks leave"],
     ],
   },
   {
@@ -353,10 +360,12 @@ type Token = { text: string; color?: string; isDim?: boolean; isItalic?: boolean
 type Style = Omit<Token, 'text'>
 
 type Tab = 'worktrees' | 'repo' | 'agents'
+// The start of the keys of each tab's rows, so `H` closes one tab's rows and leaves the others'.
+const TAB_PREFIXES: Record<Tab, string[]> = { worktrees: ['tree\t'], repo: ['dir\t', 'file\t'], agents: ['agent\t'] }
 
 // What kelp remembers across restarts: the tab, the rows opened or closed against how they start,
 // each tab's cursor and filter, and whether the repo tab shows diffs.
-type Saved = { tab: Tab; toggled: string[]; cursors: Record<Tab, string>; filters: Record<Tab, string>; isDiff: boolean; sort: Sort }
+type Saved = { tab: Tab; toggled: string[]; cursors: Record<Tab, string>; filters: Record<Tab, string>; isDiff: boolean; sort: Sort; isAllAgents: boolean }
 
 // The order of the worktrees after the base branch's, which always comes first: by name, by recent activity,
 // or those that want a look first.
@@ -385,7 +394,16 @@ type Job = { text: string; isFailed?: boolean }
 type ChatScroll = { top: number; keys: { key: string; isGap?: boolean }[]; height: number }
 
 // What windowing conversations needs: each one's scroll by its key, the row under the cursor, and the window's height.
-type ChatView = { scrolls: Map<string, ChatScroll>; cursor: string; height: number }
+type ChatView = { scrolls: Map<string, ChatScroll>; cursor: string; height: number; draft?: Draft | null; sent?: Map<string, Sent>; frame?: number }
+
+// A reply being written in the box under a claude's conversation, `group` that conversation's key: the agent it goes
+// to (by its folder and pid), what is typed so far and where in it the cursor is, and, when the agent asks leave to run
+// a tool, what it asks to run, so y or n answer it.
+type Draft = { group: string; tree: string; pid: number; who: string; text: string; at: number; asking?: string }
+
+// A reply sent to a claude and not yet in its transcript: what it said, and the key of its last prompt when it was sent,
+// so it shows at the conversation's end until a newer prompt does.
+type Sent = { text: string; after: string; at: number }
 
 type Row = {
   key: string
@@ -1078,13 +1096,75 @@ const readEnding = (file: string, at: number): Ending | null => {
   return ending
 }
 
+// The session file of the claude `pid`, ~/.claude/sessions/<pid>.json; or, when that claude has handed its conversation
+// on to a background job ("parkedJobId"), the job's, which carries the conversation on in a transcript of its own.
+// Undefined when there is none.
+const sessionOf = (pid: number): Record<string, unknown> | undefined => {
+  const dir = `${homedir()}/.claude/sessions`
+  let session: Record<string, unknown>
+  try {
+    session = JSON.parse(readFileSync(`${dir}/${pid}.json`, 'utf8'))
+  } catch {
+    return undefined
+  }
+  const job = typeof session.parkedJobId === 'string' ? session.parkedJobId : ''
+  if (!job) return session
+  // The job's file, remembered once found, as finding it reads every session file.
+  const known = jobFiles.get(job)
+  for (const file of known ? [known] : readdirSync(dir).filter(f => f.endsWith('.json'))) {
+    try {
+      const other = JSON.parse(readFileSync(`${dir}/${file}`, 'utf8'))
+      if (other.jobId !== job) continue
+      jobFiles.set(job, file)
+      return other
+    } catch {
+      // Gone, or being written.
+    }
+  }
+  jobFiles.delete(job)
+
+  return session
+}
+const jobFiles = new Map<string, string>()
+
+// What claude itself says it is doing, in ~/.claude/sessions/<pid>.json, as newer claudes keep it: "busy" at work,
+// "waiting" for the person (a question or leave to run a tool), "idle" between turns; and since when.
+// Undefined for an older claude that keeps no status.
+const claudeStatus = (pid: number) => {
+  try {
+    const session = sessionOf(pid)
+    if (!session) return undefined
+    const status = String(session.status ?? '')
+    if (!['busy', 'waiting', 'idle'].includes(status)) return undefined
+
+    return { status, since: Number(session.statusUpdatedAt) || undefined }
+  } catch {
+    return undefined
+  }
+}
+
+// A claude's state from its transcript, `state`, set right by what it says of itself where it says it: at work,
+// waiting, or not at work. The transcript still tells a turn just done (waiting for the person a while) from idle.
+const withStatus = (state: ReturnType<typeof claudeState>, pid: number): ReturnType<typeof claudeState> => {
+  const own = claudeStatus(pid)
+  if (!own) return state
+  if (own.status === 'busy') return { ...state, isBusy: true, isWaiting: false, isAsking: false, turnAt: state.turnAt || own.since, idleAt: undefined }
+  if (own.status === 'waiting') return { ...state, isBusy: false, isWaiting: true, idleAt: state.idleAt ?? own.since }
+  if (state.isBusy) return { ...state, isBusy: false, isAsking: false, idleAt: own.since }
+
+  return state
+}
+
 // The transcript of the claude `pid` running in `cwd`, its session's own as ~/.claude/sessions/<pid>.json names it,
 // else the newest there; with its session's name and when it was written. Null when there is none.
 const transcriptOf = (pid: number, cwd: string) => {
   try {
-    const session = JSON.parse(readFileSync(`${homedir()}/.claude/sessions/${pid}.json`, 'utf8'))
-    const file = `${homedir()}/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${session.sessionId}.jsonl`
-    if (existsSync(file)) return { file, at: modifiedAt(file), name: String(session.name || session.sessionId.slice(0, 8)) }
+    const session = sessionOf(pid)
+    const id = String(session?.sessionId ?? '')
+    // A job carries on in its own folder's transcripts, the same as the claude it took over from.
+    const where = typeof session?.cwd === 'string' ? session.cwd : cwd
+    const file = `${homedir()}/.claude/projects/${where.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`
+    if (id && existsSync(file)) return { file, at: modifiedAt(file), name: String(session?.name || id.slice(0, 8)) }
   } catch {
     // No session file, as with an older claude.
   }
@@ -1265,7 +1345,7 @@ const findAgents = () => {
       const transcript = transcriptOf(pid, cwd)
       const chat = transcript ? { session: transcript.name, turns: readConversation(transcript.file) } : {}
 
-      return { name, pid, cwd, ...claudeState(pid, transcript), spend: transcript ? claudeSpend(transcript.file) : undefined, ...chat }
+      return { name, pid, cwd, ...withStatus(claudeState(pid, transcript), pid), spend: transcript ? claudeSpend(transcript.file) : undefined, ...chat }
     })
 }
 
@@ -1341,9 +1421,18 @@ const paneOf = (panes: Pane[], pid: number) => {
 // Types `text` into a tmux pane and presses Enter, as if typed there. Enter waits a moment, so an agent
 // takes the text as typed rather than as a paste still coming in, where Enter would only start a new line
 // (claude 2.1 takes it even with no wait; the wait is to be safe). Whether it went.
+// Text of more than one line goes in as a bracketed paste, so its newlines stay newlines rather than each sending it.
 const typeInto = async (pane: Pane, text: string) => {
-  if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, '-l', '--', text]))) return false
-  await Bun.sleep(150)
+  if (text.includes('\n')) {
+    try {
+      const load = Bun.spawn(['tmux', 'load-buffer', '-b', 'kelp', '-'], { stdin: new Blob([text]), stdout: 'ignore', stderr: 'ignore' })
+      if ((await load.exited) !== 0) return false
+    } catch {
+      return false
+    }
+    if (!(await succeeds(['tmux', 'paste-buffer', '-p', '-d', '-b', 'kelp', '-t', pane.id]))) return false
+  } else if (!(await succeeds(['tmux', 'send-keys', '-t', pane.id, '-l', '--', text]))) return false
+  await Bun.sleep(text.includes('\n') ? 300 : 150)
 
   return succeeds(['tmux', 'send-keys', '-t', pane.id, 'Enter'])
 }
@@ -2840,6 +2929,101 @@ const statusOf = (code: string) =>
   : code.includes('A') ? { text: 'new', color: 'blue' }
   : { text: 'modified', color: 'yellow' }
 
+// Where a reply being written breaks into lines `width` wide: each line's start and end in the text, a newline or the
+// space it breaks at left out, so the cursor's place in the text maps to a line and a column.
+const draftLines = (text: string, width: number) => {
+  const lines: { start: number; end: number }[] = []
+  let from = 0
+  for (const line of text.split('\n')) {
+    let pos = 0
+    if (line.length === 0) lines.push({ start: from, end: from })
+    while (pos < line.length) {
+      if (line.length - pos <= width) {
+        lines.push({ start: from + pos, end: from + line.length })
+        break
+      }
+      const space = line.lastIndexOf(' ', pos + width)
+      const cut = space > pos ? space : pos + width
+      lines.push({ start: from + pos, end: from + cut })
+      pos = space > pos ? cut + 1 : cut
+      // A line ending in the space it broke at leaves an empty line for the cursor after it.
+      if (pos === line.length) lines.push({ start: from + pos, end: from + pos })
+    }
+    from += line.length + 1
+  }
+
+  return lines
+}
+
+// The line of `lines` the cursor at `at` is on.
+const lineOfCursor = (lines: { start: number; end: number }[], at: number) => Math.max(0, lines.findLastIndex(l => l.start <= at))
+
+// The text area of the reply box: its width inside the border and the "> " before the text.
+const draftWidth = (width: number) => Math.max(8, width - 6)
+
+// The glyphs claude's own "working" line cycles through, and how often kelp moves it on. Not ✳, which many
+// terminals draw as its emoji, a green square; claude itself uses * there.
+const SPINNER = ['·', '✢', '*', '✶', '✻', '✽', '✻', '✶', '*', '✢']
+const SPINNER_MS = 120
+
+// How many rows the reply box takes, so the conversation's window can give up room for it.
+const draftHeight = (draft: Draft, width: number) =>
+  Math.min(DRAFT_LINES, draftLines(draft.text, draftWidth(width)).length) + 5 + (draft.asking ? 3 : 0)
+
+// The rows of the reply box under conversation `group` at `depth`, `width` wide, laid out as claude's own prompt is:
+// while `agent` works, a line saying so with a spinner (`frame` its step) and for how long, `since`; then a rounded,
+// dim box with "> " before the text and the cursor in it (DRAFT_LINES of it at most, those around the cursor),
+// yellow and saying what it asks to run when the agent asks leave; and under it, dim, the keys that work in it.
+const draftRows = (draft: Draft, group: string, depth: number, width: number, working: number | undefined, frame: number): Row[] => {
+  const rows: Row[] = []
+  const push = (key: string, node: JSX.Element) => rows.push({ key: `${group}\tdraft\t${key}`, parent: group, depth, node })
+  push('gap', <Text> </Text>)
+  if (working !== undefined && !draft.asking) {
+    push('working', (
+      <Text wrap="truncate-end">
+        <Text color={CLAUDE_COLOR}>{SPINNER[frame % SPINNER.length]} Working…</Text>
+        <Text dimColor> ({duration(Date.now() - working)})</Text>
+      </Text>
+    ))
+  }
+  const color = draft.asking ? 'yellow' : undefined
+  const border = (key: string, left: string, right: string) =>
+    push(key, <Text color={color} dimColor={!color} wrap="truncate-end">{left}{'─'.repeat(Math.max(0, width - 2))}{right}</Text>)
+  const inner = width - 4
+  const line = (key: string, node: JSX.Element, used: number) =>
+    push(key, (
+      <Text wrap="truncate-end">
+        <Text color={color} dimColor={!color}>│ </Text>
+        {node}
+        {' '.repeat(Math.max(0, inner - used))}
+        <Text color={color} dimColor={!color}> │</Text>
+      </Text>
+    ))
+  border('top', '╭', '╮')
+  if (draft.asking) {
+    const asks = wrapText(`${draft.who} asks to run ${draft.asking}`, inner).slice(0, 2)
+    asks.forEach((text, n) => line(`asks${n}`, <Text color="yellow" bold={n === 0}>{text}</Text>, text.length))
+    const hint = draft.text ? '⏎ says no, with what you typed as what to do instead' : 'y allow · n deny · or type what to do instead'
+    line('hint', <Text dimColor>{hint.slice(0, inner)}</Text>, Math.min(inner, hint.length))
+  }
+  const lines = draftLines(draft.text, draftWidth(width))
+  const at = lineOfCursor(lines, draft.at)
+  const from = Math.max(0, at - DRAFT_LINES + 1)
+  lines.slice(from, from + DRAFT_LINES).forEach((l, k) => {
+    const n = from + k
+    const text = draft.text.slice(l.start, l.end).replace(/\t/g, ' ')
+    const lead = <Text>{n === 0 ? '> ' : '  '}</Text>
+    if (n !== at) return line(`line${n}`, <Text>{lead}{text}</Text>, 2 + text.length)
+    const col = draft.at - l.start
+    line(`line${n}`, <Text>{lead}{text.slice(0, col)}<Text inverse>{text[col] ?? ' '}</Text>{text.slice(col + 1)}</Text>, 2 + Math.max(text.length, col + 1))
+  })
+  border('bottom', '╰', '╯')
+  const scrolled = lines.length > DRAFT_LINES ? ` · line ${at + 1} of ${lines.length}` : ''
+  push('end', <Text dimColor wrap="truncate-end">  ⏎ send · alt+⏎ new line · PgUp PgDn scroll · esc close{scrolled}</Text>)
+
+  return rows
+}
+
 // The rows of each claude's conversation among `agents`, under the row `parent` at `depth`, closed unless
 // `isOpenByDefault`: its latest entries, newest at the bottom. A prompt (a cyan "›", bold) or reply (an orange "●",
 // its markdown shown) has a blank line before it and shows its first lines until opened; a tool call is one dim line,
@@ -2931,6 +3115,26 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
         })
       })
     }
+    // A reply just sent shows at the end, dim, until the transcript has it.
+    const sent = view.sent?.get(group)
+    const isSending = sent !== undefined && sent.after === (agent.turns!.findLast(t => t.kind === 'prompt')?.key ?? '')
+    if (isSending) {
+      body.push({ key: `${group}\tsent\tgap`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
+      const lines = wrapText(sent.text, width)
+      lines.forEach((line, n) =>
+        body.push({
+          key: `${group}\tsent\t${n}`,
+          parent: group,
+          depth: inner,
+          node: (
+            <Text wrap="truncate-end">
+              <Text bold color="cyan">{n === 0 ? '› ' : '  '}</Text>
+              <Text bold>{line}</Text>
+            </Text>
+          ),
+        }),
+      )
+    }
     // The window: kept on the cursor's row when that is in it, else where it was scrolled to, else on the newest rows.
     const height = Math.min(body.length, view.height)
     const most = body.length - height
@@ -2947,6 +3151,9 @@ const chatRows = (agents: Agent[], parent: string, depth: number, folder: string
     }
     const below = most - top
     if (below > 0) rows.push({ key: `${group}\tbelow`, parent: group, depth: inner, isGap: true, chat: { group }, node: <Text dimColor>↓ {below} more</Text> })
+    // Claude is at work from when a reply is sent, before its transcript says so.
+    const working = agent.isWaiting ? undefined : agent.isBusy ? (agent.turnAt ?? sent?.at) : isSending ? sent.at : undefined
+    if (view.draft?.group === group) rows.push(...draftRows(view.draft, group, inner, Math.max(20, columns - inner * 2), working, view.frame ?? 0))
     // A blank line after an open conversation keeps what follows from crowding its last entry.
     rows.push({ key: `${group}\tend`, parent: group, depth: inner, isGap: true, node: <Text> </Text> })
   }
@@ -3328,6 +3535,10 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // Whether the repo tab shows an open file or its diff against HEAD.
   const [isDiff, setIsDiff] = useState(saved.isDiff === true)
   const [sort, setSort] = useState<Sort>(SORTS.find(s => s === saved.sort) ?? SORTS[0])
+  // Whether the agents tab, its count and the bell cover every agent on the machine, or only the repository's.
+  const [isAllAgents, setIsAllAgents] = useState(saved.isAllAgents !== false)
+  const isAllAgentsRef = useRef(isAllAgents)
+  isAllAgentsRef.current = isAllAgents
   const [notice, setNotice] = useState('')
   // What kelp is doing to each worktree, by its folder.
   const [jobs, setJobs] = useState(new Map<string, Job>())
@@ -3347,6 +3558,17 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     setPromptState(next)
   }
   const [armed, setArmed] = useState<Armed | null>(null)
+  // The reply being written under a claude's conversation, kept in a ref too so keys typed faster than a redraw all land.
+  const [draft, setDraftState] = useState<Draft | null>(null)
+  const draftRef = useRef<Draft | null>(null)
+  const setDraft = (next: Draft | null) => {
+    draftRef.current = next
+    setDraftState(next)
+  }
+  // What was left typed in each conversation's box when it was closed, by the conversation's key, to come back on reopening.
+  const drafts = useRef(new Map<string, string>())
+  // Replies sent and not yet in their claude's transcript, by the conversation's key.
+  const [sent, setSent] = useState(new Map<string, Sent>())
   // Whether `?`'s list of keys covers the rows.
   const [isHelp, setIsHelp] = useState(false)
   // How far the list of keys is scrolled, when it is longer than the screen.
@@ -3374,11 +3596,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
   // Remembers the view a moment after it last changed, and on quitting, so a restart opens it as it was.
   useEffect(() => {
-    latest = { tab, toggled: [...toggled].slice(-MAX_TOGGLED), cursors, filters, isDiff, sort }
+    latest = { tab, toggled: [...toggled].slice(-MAX_TOGGLED), cursors, filters, isDiff, sort, isAllAgents }
     const timer = setTimeout(() => latest && save(STATE_FILE, latest), SAVE_MS)
 
     return () => clearTimeout(timer)
-  }, [tab, toggled, cursors, filters, isDiff, sort])
+  }, [tab, toggled, cursors, filters, isDiff, sort, isAllAgents])
 
   useEffect(() => {
     const onResize = () => setSize({ columns: stdout.columns, rows: stdout.rows })
@@ -3406,7 +3628,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       try {
         const [found, listed] = await Promise.all([loadRepo(root), tabRef.current === 'repo' ? loadFiles(root) : undefined])
         // An agent that starts waiting rings the bell, once, and says so; not one already waiting when kelp starts.
-        const agents = [...(found?.trees ?? []), ...(found?.away ?? [])].flatMap(t => t.agents.map(agent => ({ agent, tree: t })))
+        const agents = [...(found?.trees ?? []), ...(isAllAgentsRef.current ? found?.away ?? [] : [])].flatMap(t => t.agents.map(agent => ({ agent, tree: t })))
         const started = agents.filter(({ agent }) => agent.isWaiting && wasWaiting?.get(agent.pid) === false)
         wasWaiting = new Map(agents.map(({ agent }) => [agent.pid, agent.isWaiting === true]))
         if (started.length > 0) {
@@ -3414,20 +3636,6 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
           const { agent, tree } = started[0]
           const others = started.length > 1 ? `, and ${started.length - 1} more` : ''
           setNotice(`◆ ${agent.name} in ${placeName(tree)} is waiting${agent.says ? `: ${agent.says.slice(0, 60)}` : ''}${others}`)
-          // Its conversation opens, its last entry too, so what it asks shows once its worktree is opened.
-          setToggled(cur => {
-            const next = new Set(cur)
-            for (const { agent, tree } of started.filter(s => s.agent.turns)) {
-              const group = `tree\t${tree.path}\tchat\t${agent.session}`
-              const last = agent.turns!.at(-1)
-              next.add(group)
-              if (last) next.add(`${group}\t${last.key}`)
-              // In the agents tab its conversation is open already, so only its last entry opens.
-              if (last) next.add(`agent\t${tree.path}\t${agent.pid}\tchat\t${agent.session}\t${last.key}`)
-            }
-
-            return next
-          })
         }
         const text = JSON.stringify(found)
         if (text !== seen) {
@@ -3485,6 +3693,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     }
   }, [dir, github])
 
+  // While the reply box is open, its spinner and time move on; drawn only when they change, line by line.
+  useEffect(() => {
+    if (!draft) return
+    const timer = setInterval(() => redraw(n => n + 1), SPINNER_MS)
+
+    return () => clearInterval(timer)
+  }, [draft !== null])
+
   // Ticks while a command runs, or the agents tab shows, so their times stay current.
   useEffect(() => {
     const timer = setInterval(() => {
@@ -3512,12 +3728,14 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   // Gutter of two, and one column spare so a row never touches the edge and wraps.
   const columns = Math.max(20, size.columns - 3)
   const empty = { rows: [] as Row[], wanted: [] as Wanted[] }
-  const chat: ChatView = { scrolls: chatScrolls.current, cursor: cursors[tab], height: Math.max(CHAT_MIN_ROWS, Math.floor((size.rows - 3) * CHAT_SHARE)) }
+  // With a reply box open, the conversation's window gives up what room the box needs on a short screen.
+  const boxRows = draft ? draftHeight(draft, columns - 4) : 0
+  const chat: ChatView = { scrolls: chatScrolls.current, cursor: cursors[tab], height: Math.max(1, Math.min(chatHeight(size.rows - 3), size.rows - 6 - boxRows)), draft, sent, frame: Math.floor(Date.now() / SPINNER_MS) }
   const { rows, wanted } =
     tab === 'repo'
       ? (files ? buildRepoRows(files, isOpen, diffs, isDiff, filters.repo) : empty)
       : tab === 'agents'
-        ? (repo ? buildAgentRows(repo, isOpen, columns, filters.agents, chat) : empty)
+        ? (repo ? buildAgentRows(isAllAgents ? repo : { ...repo, away: [] }, isOpen, columns, filters.agents, chat) : empty)
         : repo ? buildRows({ ...repo, trees: sortTrees(repo.trees, sort) }, isOpen, diffs, columns, prs, filters.worktrees, jobs, chat) : empty
   // The repo tab reads its open files again on every refresh, as an edit need not change what git reports.
   const current = tab === 'repo' ? updatedAt : version
@@ -3560,6 +3778,27 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
 
     return next
   })
+  // `H` closes every row in the tab; pressed again before anything else opens or closes, it opens them as they were.
+  const uncollapse = useRef<{ tab: Tab; before: Set<string>; after: Set<string> } | null>(null)
+  const collapseAll = () => {
+    const last = uncollapse.current
+    if (last?.tab === tab && last.after === toggled) {
+      uncollapse.current = null
+      setToggled(last.before)
+      return setNotice('Opened again what H closed')
+    }
+    const prefixes = TAB_PREFIXES[tab]
+    const next = new Set([...toggled].filter(k => !prefixes.some(p => k.startsWith(p))))
+    // Rows open to start with stay closed by being marked toggled.
+    for (const r of rows) if (r.canOpen && r.isOpenByDefault && r.depth === 0) next.add(r.key)
+    uncollapse.current = { tab, before: toggled, after: next }
+    setToggled(next)
+    // The cursor goes to the top-level row it sat under.
+    let at: Row | undefined = row
+    while (at?.parent) at = rows.find(p => p.key === at!.parent)
+    if (at) setCursor(at.key)
+    setNotice('Closed every row; H again opens them as they were')
+  }
   const row = rows[index]
   const parentOf = (r: Row) => rows.find(p => p.key === r.parent)
   // Opens or closes the row under the cursor, or the row it sits under when it does neither.
@@ -3619,7 +3858,8 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     if (base === 64) return isHelp ? scrollHelp(-WHEEL_LINES) : scroll(-WHEEL_LINES)
     if (base === 65) return isHelp ? scrollHelp(WHEEL_LINES) : scroll(WHEEL_LINES)
     if (isHelp) return
-    if (base !== 0) return
+    // A click while writing a reply would take the cursor, and the box with it, away; esc closes the box first.
+    if (base !== 0 || draftRef.current) return
     const tabHit = line === 1 ? TABS.find(t => column >= tabColumns(t)[0] && column <= tabColumns(t)[1]) : undefined
     if (tabHit) return switchTab(tabHit)
     // The header is the first line, so the rows start on the second.
@@ -3656,7 +3896,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const tree = placeUnder()
     if (!repo || !tree) return setNotice('Move to a worktree to answer its agent.')
     const name = placeName(tree)
-    const agent = agentUnder() ?? tree.agents.find(a => a.isWaiting) ?? tree.agents.find(a => a.isBusy === false) ?? tree.agents[0]
+    // In a conversation, the claude it is with.
+    const chatAt = row?.key.split('\t') ?? []
+    const chatPart = tab === 'agents' ? 3 : 2
+    const session = chatAt[chatPart] === 'chat' ? chatAt[chatPart + 1] : undefined
+    const agent = agentUnder() ?? (session ? tree.agents.find(a => a.session === session) : undefined) ?? tree.agents.find(a => a.isWaiting) ?? tree.agents.find(a => a.isBusy === false) ?? tree.agents[0]
     if (!agent) return setNotice(`No agent runs in ${name}, so there is nothing to send to: a starts claude.`)
     const who = `${agent.name} in ${name}`
     if (!process.env.TMUX) return setNotice(`kelp is not in tmux, so it has no pane to send to ${who} through.`)
@@ -3665,8 +3909,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     const state = agent.isWaiting ? 'waiting' : agent.isBusy ? 'working' : 'idle'
     // A line under a file, not the file's own line, which opens and closes.
     const at = row?.file && !row.canOpen && row.file.startsWith(`${tree.path}/`) ? `${row.file.slice(tree.path.length + 1)}:${row.line ?? 1}` : ''
+    const isAsking = agent.isAsking || (await isAskingIn(agent.name, pane))
+    // A claude with a conversation kelp shows is answered in a box under it, which stays open to go on talking.
+    if (agent.turns && !at) return openDraft(tree, agent, who, isAsking)
     // Asking leave to run something, its menu or prompt wants yes or no, not free text; a note goes with a no.
-    if (agent.isAsking || (await isAskingIn(agent.name, pane))) {
+    if (isAsking) {
       const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
       return ask(`${who} asks to run ${asks.length > 50 ? `${asks.slice(0, 49)}…` : asks} · allow? y/n, or n and what to do instead:`, async answer => {
         const no = answer.match(/^no?(?:\s+|$)(.*)$/i)
@@ -3684,6 +3931,122 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       refresh.current()
     })
   }
+
+  // Opens the reply box under `agent`'s conversation, opening the worktree or agent and the conversation as needed,
+  // with what was left typed there last time.
+  const openDraft = (tree: Place, agent: Agent, who: string, isAsking: boolean) => {
+    const owner = tab === 'agents' ? `agent\t${tree.path}\t${agent.pid}` : `tree\t${tree.path}`
+    const group = `${owner}\tchat\t${agent.session}`
+    if (!isOpen(owner, false)) toggle(owner)
+    if (!isOpen(group, tab === 'agents')) toggle(group)
+    const text = drafts.current.get(group) ?? ''
+    const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
+    setDraft({ group, tree: tree.path, pid: agent.pid, who, text, at: text.length, asking: isAsking ? asks : undefined })
+    const scroll = chatScrolls.current.get(group)
+    if (scroll) scroll.top = Infinity
+    setCursor(`${group}\tdraft\tend`)
+  }
+
+  // Closes the reply box, keeping what was typed for next time, and puts the cursor back on its conversation.
+  const closeDraft = () => {
+    const d = draftRef.current
+    if (!d) return
+    if (d.text) drafts.current.set(d.group, d.text)
+    else drafts.current.delete(d.group)
+    setDraft(null)
+    setCursor(d.group)
+  }
+
+  // Sends what the reply box holds to its agent's tmux pane, or, while it asks leave, answers it: `allow` true or
+  // false for y or n, else no with the words typed as what to do instead. The box stays open, emptied, to go on talking.
+  const sendDraft = async (allow?: boolean) => {
+    const d = draftRef.current
+    if (!d || !repo) return
+    const tree = [...repo.trees, ...repo.away].find(t => t.path === d.tree)
+    const agent = tree?.agents.find(a => a.pid === d.pid)
+    const pane = agent && paneOf(repo.panes, agent.pid)
+    if (!agent || !pane) return setNotice(`${d.who} is gone, or runs in no tmux pane kelp can see.`)
+    const text = d.text.trim()
+    if (d.asking) {
+      if (allow === undefined && !text) return
+      const isSent = await answerAsking(agent.name, pane, allow === true, allow === undefined ? text : '')
+      setNotice(!isSent ? `Couldn't send keys to tmux pane ${pane.id}.` : allow ? `Allowed ${d.who} to run ${d.asking}.` : `Told ${d.who} no${text && allow === undefined ? ', and what to do instead' : ''}.`)
+      if (isSent) {
+        if (allow === undefined) drafts.current.delete(d.group)
+        setDraft({ ...draftRef.current!, asking: undefined, ...(allow === undefined && { text: '', at: 0 }) })
+      }
+      return refresh.current()
+    }
+    if (!text) return
+    // It may have started asking since the box opened; then it wants y or n first.
+    if (agent.isAsking || (await isAskingIn(agent.name, pane))) {
+      const asks = agent.says?.startsWith('wants ') ? agent.says.slice(6) : 'a tool'
+      setDraft({ ...draftRef.current!, asking: asks })
+      return setNotice(`${d.who} now asks leave to run ${asks}: y or n first, or ⏎ to say no with what you typed.`)
+    }
+    const isSent = await typeInto(pane, text)
+    if (!isSent) return setNotice(`Couldn't type into tmux pane ${pane.id}.`)
+    const after = agent.turns?.findLast(t => t.kind === 'prompt')?.key ?? ''
+    setSent(cur => new Map(cur).set(d.group, { text, after, at: Date.now() }))
+    drafts.current.delete(d.group)
+    if (draftRef.current?.group === d.group) setDraft({ ...draftRef.current, text: '', at: 0 })
+    const scroll = chatScrolls.current.get(d.group)
+    if (scroll) scroll.top = Infinity
+    refresh.current()
+  }
+
+  // A key typed in the reply box: ⏎ sends (alt+⏎, shift+⏎ or a \ before ⏎ start a new line), esc closes it, the arrows,
+  // home and end (ctrl+a, ctrl+e) move, alt+← → by words, backspace, alt+backspace or ctrl+w, ctrl+u and ctrl+k erase,
+  // PgUp and PgDn scroll the conversation. While its agent asks leave, y or n alone answer.
+  const typeInDraft = (input: string, key: Parameters<Parameters<typeof useInput>[0]>[1]) => {
+    const d = draftRef.current!
+    const put = (text: string, at: number) => setDraft({ ...d, text, at: Math.max(0, Math.min(text.length, at)) })
+    const { text, at } = d
+    const lines = draftLines(text, draftWidth(columns - 4))
+    const line = lineOfCursor(lines, at)
+    const wordBack = () => at - (text.slice(0, at).match(/\S*\s*$/)?.[0].length ?? 0)
+    const wordOn = () => at + (text.slice(at).match(/^\s*\S*/)?.[0].length ?? 0)
+    if (key.escape) return closeDraft()
+    if (d.asking && !text && /^[yn]$/i.test(input)) return sendDraft(input.toLowerCase() === 'y')
+    if (key.return) {
+      if (key.meta || key.shift) return put(`${text.slice(0, at)}\n${text.slice(at)}`, at + 1)
+      if (text[at - 1] === '\\') return put(`${text.slice(0, at - 1)}\n${text.slice(at)}`, at)
+      return sendDraft()
+    }
+    if (key.pageUp || key.pageDown) return scrollChat(d.group, key.pageUp ? -chat.height : chat.height)
+    if (key.leftArrow) return put(text, key.meta || key.ctrl ? wordBack() : at - 1)
+    if (key.rightArrow) return put(text, key.meta || key.ctrl ? wordOn() : at + 1)
+    if (key.upArrow || key.downArrow) {
+      const to = lines[line + (key.upArrow ? -1 : 1)]
+      if (!to) return put(text, key.upArrow ? 0 : text.length)
+      return put(text, Math.min(to.start + (at - lines[line].start), to.end))
+    }
+    if (key.home || (key.ctrl && input === 'a')) return put(text, lines[line].start)
+    if (key.end || (key.ctrl && input === 'e')) return put(text, lines[line].end)
+    if ((key.backspace || key.delete) && (key.meta || key.ctrl)) return put(text.slice(0, wordBack()) + text.slice(at), wordBack())
+    if (key.ctrl && input === 'w') return put(text.slice(0, wordBack()) + text.slice(at), wordBack())
+    if (key.backspace || key.delete) return at > 0 && put(text.slice(0, at - 1) + text.slice(at), at - 1)
+    if (key.ctrl && input === 'u') return put(text.slice(0, lines[line].start) + text.slice(at), lines[line].start)
+    if (key.ctrl && input === 'k') return put(text.slice(0, at) + text.slice(lines[line].end), at)
+    if (key.ctrl || key.meta || key.tab || !input) return
+    const typed = input.replace(/\r\n?/g, '\n').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '')
+    put(text.slice(0, at) + typed + text.slice(at), at + typed.length)
+  }
+
+  // Pasted text goes into the reply box whole, its newlines kept, or into the footer's question on one line.
+  usePaste(
+    pasted => {
+      const d = draftRef.current
+      const clean = pasted.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '')
+      if (d) return setDraft({ ...d, text: d.text.slice(0, d.at) + clean + d.text.slice(d.at), at: d.at + clean.length })
+      const p = promptRef.current
+      if (!p) return
+      const text = p.text + clean.replace(/\n/g, ' ')
+      setPrompt({ ...p, text })
+      p.onChange?.(text)
+    },
+    { isActive: draft !== null || prompt !== null },
+  )
 
   // The agent under the cursor in the agents tab, its line or one of its opened lines, keyed "agent\t<worktree>\t<pid>".
   const agentUnder = () => {
@@ -4278,6 +4641,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
       if (mouse[4] === 'M') onMouse(Number(mouse[1]), Number(mouse[2]), Number(mouse[3]))
       return
     }
+    if (draftRef.current) return typeInDraft(input, key)
     if (promptRef.current) return typeInPrompt(input, key)
     // Any other key lets an armed action go.
     if (armed && input !== armed.input) setArmed(null)
@@ -4391,6 +4755,11 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
     else if (input === 'G') moveTo(rows.length - 1, -1)
     else if (key.return || input === ' ') press()
     else if (key.rightArrow || input === 'l') press(true)
+    else if (input === 'H') collapseAll()
+    else if (input === 'v' && tab === 'agents') {
+      setIsAllAgents(!isAllAgents)
+      setNotice(isAllAgents ? 'Showing only the agents in this repository' : 'Showing every agent on the machine')
+    }
     else if (key.leftArrow || input === 'h') {
       // Closes an open row, else steps out to the row it sits under.
       if (row?.canOpen && isOpen(row.key, row.isOpenByDefault === true)) toggle(row.key)
@@ -4404,7 +4773,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const shared = repo ? [...touchedBy(repo).values()].filter(b => b.length > 1).length : 0
   const conflicting = repo ? repo.trees.filter(t => t.conflicts.length > 0).length : 0
   const changed = files ? Object.keys(files.status).length : 0
-  const agents = repo ? [...repo.trees, ...repo.away].flatMap(t => t.agents) : []
+  const agents = repo ? [...repo.trees, ...(isAllAgents ? repo.away : [])].flatMap(t => t.agents) : []
   const waitingCount = agents.filter(a => a.isWaiting).length
   const header = (
     <Text wrap="truncate-end">
@@ -4427,7 +4796,7 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
         <Text dimColor>  {shortPath(files.dir)} · {files.files.length}{files.isCut ? '+' : ''} files · showing {isDiff ? 'diffs vs HEAD' : 'files'}</Text>
       )}
       {tab === 'repo' && changed > 0 && <Text color="yellow"> · {changed} changed</Text>}
-      {tab === 'agents' && repo && <Text dimColor>  {agents.length} agent{agents.length === 1 ? '' : 's'}</Text>}
+      {tab === 'agents' && repo && <Text dimColor>  {agents.length} agent{agents.length === 1 ? '' : 's'} · {isAllAgents ? 'all on the machine' : 'this repository only'}</Text>}
       {tab === 'agents' && waitingCount > 0 && <Text color="yellow"> · {waitingCount} waiting</Text>}
     </Text>
   )
@@ -4441,13 +4810,18 @@ const App = ({ root, saved }: { root: string; saved: Partial<Saved> }) => {
   const find = filters[tab] ? '/ change filter · esc clear it' : '/ filter'
   // Answering is offered where an agent waits for the person.
   const replyKey = (tab === 'agents' ? agentUnder() : treeUnder()?.agents.some(a => a.isWaiting)) ? ' · > reply' : ''
-  const keys = isHelp
+  // Offered once something in the tab is open, or straight after H, to open it all again.
+  const canReopen = uncollapse.current?.tab === tab && uncollapse.current.after === toggled
+  const collapseKey = canReopen ? ' · H reopen all' : rows.some(r => r.canOpen && isOpen(r.key, r.isOpenByDefault === true)) ? ' · H collapse all' : ''
+  const keys = draft
+    ? `writing to ${draft.who} · esc closes the box, keeping what you typed · the wheel scrolls the conversation`
+    : isHelp
     ? `? esc close${helpLines.length > height ? ' · j k scroll' : ''}`
     : tab === 'repo'
-      ? `⏎ open/close · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab agents · ? keys · q quit`
+      ? `⏎ open/close${collapseKey} · ${find} · d ${isDiff ? 'files' : 'diffs'} · o nvim · c commit${discardKey} · tab agents · ? keys · q quit`
       : tab === 'agents'
-        ? `⏎ open · ${find} · t tmux${replyKey} · a claude · N task · tab worktrees · ? keys · q quit`
-        : `⏎ open · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
+        ? `⏎ open${collapseKey} · ${find} · v ${isAllAgents ? 'repo only' : 'all agents'} · t tmux${replyKey} · a claude · N task · tab worktrees · ? keys · q quit`
+        : `⏎ open${collapseKey} · ${find} · n new · t tmux · a claude${replyKey} · ! run${isRunning(runs.get(treeAtCursor() ?? '')) ? ' · K stop' : ''}${cursorTree && serverUrl(cursorTree) ? ' · B browser' : ''} · c commit${discardKey} · ${mergeKeys}${repo?.remote ? ' · p push' : ''}${repo?.github ? ' · P PR' : ''} · ? keys · q quit`
   const help = (
     <Box flexDirection="column">
       {helpLines.slice(shownHelpTop, shownHelpTop + helpRoom).map((cells, n) => (
